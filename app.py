@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import re
 import tempfile
@@ -17,8 +18,14 @@ except ImportError:
     nltk = None
     SentimentIntensityAnalyzer = None
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
 
 FINVIZ_URL = "https://finviz.com/quote.ashx?t="
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
 RISK_KEYWORDS = {
     "监管/法律": [
@@ -234,6 +241,22 @@ def cache_resource(func):
     return st.cache(allow_output_mutation=True)(func)
 
 
+def get_config_value(name, default=None):
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def get_openai_client():
+    api_key = get_config_value("OPENAI_API_KEY")
+    if OpenAI is None or not api_key:
+        return None
+    return OpenAI(api_key=api_key)
+
+
 @cache_resource
 def get_sentiment_analyzer():
     if nltk is None or SentimentIntensityAnalyzer is None:
@@ -429,6 +452,112 @@ def infer_goal_profile(mission):
     return best_profile
 
 
+def profile_by_key(key):
+    if key == DEFAULT_GOAL_PROFILE["key"]:
+        return DEFAULT_GOAL_PROFILE
+    for profile in GOAL_PROFILES:
+        if profile["key"] == key:
+            return profile
+    return None
+
+
+def goal_profile_options():
+    profiles = [DEFAULT_GOAL_PROFILE] + GOAL_PROFILES
+    return "\n".join(
+        [
+            (
+                f"- key: {profile['key']} | label: {profile['label']} | "
+                f"priority_categories: {format_categories(profile['priority_categories'])} | "
+                f"description: {profile['description']}"
+            )
+            for profile in profiles
+        ]
+    )
+
+
+def extract_json_object(text):
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def call_llm_text(system_prompt, user_prompt, model):
+    client = get_openai_client()
+    if client is None:
+        return None
+
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return response.output_text
+
+
+def infer_goal_profile_with_llm(mission, model):
+    system_prompt = """
+You are the goal analysis agent for StockPilot Agent.
+Map the user's natural-language investing research goal to exactly one supported goal profile.
+Return only compact JSON with keys: profile_key, reason.
+Do not provide investment advice.
+""".strip()
+    user_prompt = f"""
+User analysis goal:
+{mission}
+
+Supported goal profiles:
+{goal_profile_options()}
+
+Rules:
+- Choose the closest profile_key from the supported list.
+- reason must be Chinese, concise, and explain why this profile fits.
+- Return JSON only.
+""".strip()
+
+    output = call_llm_text(system_prompt, user_prompt, model)
+    parsed = extract_json_object(output)
+    if not parsed:
+        return None
+
+    profile = profile_by_key(parsed.get("profile_key"))
+    if not profile:
+        return None
+
+    enriched = dict(profile)
+    enriched["analysis_source"] = "LLM"
+    enriched["llm_reason"] = parsed.get("reason", "")
+    return enriched
+
+
+def analyze_goal(mission, use_llm, model):
+    if use_llm:
+        try:
+            profile = infer_goal_profile_with_llm(mission, model)
+            if profile:
+                return profile, "LLM goal analysis"
+        except Exception as error:
+            fallback = dict(infer_goal_profile(mission))
+            fallback["analysis_source"] = "Rule fallback"
+            fallback["llm_reason"] = f"LLM goal analysis failed: {error}"
+            return fallback, "Rule fallback after LLM error"
+
+    profile = dict(infer_goal_profile(mission))
+    profile["analysis_source"] = "Rule fallback"
+    if use_llm:
+        profile["llm_reason"] = "OPENAI_API_KEY is not configured or openai package is unavailable."
+        return profile, "Rule fallback because LLM is unavailable"
+    profile["llm_reason"] = "LLM mode is off."
+    return profile, "Rule-based goal parser"
+
+
 def format_categories(categories):
     return "、".join(categories)
 
@@ -519,7 +648,7 @@ def top_headlines(scored_news, label, limit=3):
     return rows.head(limit)["headline"].tolist()
 
 
-def build_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note):
+def build_rule_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note):
     stance = choose_stance(summary, risk)
     positives = top_headlines(scored_news, "Positive")
     negatives = top_headlines(scored_news, "Negative")
@@ -568,6 +697,101 @@ def build_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_ne
 """.strip()
 
 
+def compact_headlines(scored_news, limit=10):
+    rows = (
+        scored_news.reset_index()
+        .sort_values("datetime", ascending=False)
+        .head(limit)
+    )
+    return [
+        {
+            "datetime": row["datetime"].strftime("%Y-%m-%d %H:%M"),
+            "headline": row["headline"],
+            "sentiment_label": row["sentiment_label"],
+            "sentiment_score": round(float(row["sentiment_score"]), 3),
+        }
+        for _, row in rows.iterrows()
+    ]
+
+
+def build_llm_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note, model):
+    system_prompt = """
+You are Portfolio Copilot inside StockPilot Agent.
+Write a concise Chinese holding-observation memo for a long-term individual investor.
+Use only the supplied metrics, headlines, and risk findings.
+Do not invent news, prices, financial facts, or future predictions.
+Do not provide direct buy/sell/hold instructions.
+Frame conclusions as observation and review guidance, not investment advice.
+""".strip()
+
+    payload = {
+        "ticker": ticker,
+        "user_goal": mission,
+        "goal_profile": {
+            "label": goal_profile["label"],
+            "description": goal_profile["description"],
+            "priority_categories": goal_profile["priority_categories"],
+            "source": goal_profile.get("analysis_source", "unknown"),
+            "reason": goal_profile.get("llm_reason", ""),
+        },
+        "source_note": source_note,
+        "metrics": {
+            "avg_sentiment": round(summary["avg_score"], 3),
+            "bullishness": summary["bullishness"],
+            "positive_headlines": summary["positive"],
+            "neutral_headlines": summary["neutral"],
+            "negative_headlines": summary["negative"],
+            "risk_level": risk["level"],
+            "risk_score": risk["score"],
+        },
+        "market_snapshot": snapshot,
+        "risk_findings": risk["findings"],
+        "recent_headlines": compact_headlines(scored_news),
+    }
+    user_prompt = f"""
+Create the memo in Markdown with these sections:
+1. StockPilot Agent Memo: {ticker}
+2. User Goal
+3. Goal Focus
+4. Observation
+5. Key Readings
+6. Evidence
+7. Risks To Review
+8. Next Steps
+9. Disclaimer
+
+Data:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+""".strip()
+
+    return call_llm_text(system_prompt, user_prompt, model)
+
+
+def build_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note, use_llm, model):
+    if use_llm:
+        try:
+            memo = build_llm_memo(
+                ticker,
+                mission,
+                goal_profile,
+                summary,
+                risk,
+                snapshot,
+                scored_news,
+                source_note,
+                model,
+            )
+            if memo:
+                return memo.strip(), "LLM memo generator"
+        except Exception:
+            pass
+
+    memo = build_rule_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note)
+    if use_llm:
+        return memo, "Rule-based memo fallback"
+    return memo, "Rule-based decision writer"
+
+
 def plot_sentiment_timeline(scored_news, ticker):
     timeline = (
         scored_news["sentiment_score"]
@@ -612,15 +836,16 @@ def plot_sentiment_mix(scored_news):
     return fig
 
 
-def run_workflow(ticker, mission, max_headlines, allow_fallback_data):
-    goal_profile = infer_goal_profile(mission)
+def run_workflow(ticker, mission, max_headlines, allow_fallback_data, use_llm=False, llm_model=DEFAULT_LLM_MODEL):
+    goal_profile, goal_tool = analyze_goal(mission, use_llm, llm_model)
     steps = [
         {
             "agent": "Briefing Agent",
-            "tool": "Goal parser",
+            "tool": goal_tool,
             "output": (
                 f"识别到分析重点：{goal_profile['label']}。"
                 f"优先关注：{format_categories(goal_profile['priority_categories'])}。"
+                f"{'原因：' + goal_profile.get('llm_reason', '') if goal_profile.get('llm_reason') else ''}"
             ),
         }
     ]
@@ -676,11 +901,22 @@ def run_workflow(ticker, mission, max_headlines, allow_fallback_data):
         }
     )
 
-    memo = build_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note)
+    memo, memo_tool = build_memo(
+        ticker,
+        mission,
+        goal_profile,
+        summary,
+        risk,
+        snapshot,
+        scored_news,
+        source_note,
+        use_llm,
+        llm_model,
+    )
     steps.append(
         {
             "agent": "Portfolio Copilot",
-            "tool": "Rule-based decision writer",
+            "tool": memo_tool,
             "output": "已生成可用于投资复盘、关注列表更新或个人记录的结构化 memo。",
         }
     )
@@ -695,6 +931,8 @@ def run_workflow(ticker, mission, max_headlines, allow_fallback_data):
         "summary": summary,
         "risk": risk,
         "memo": memo,
+        "memo_tool": memo_tool,
+        "goal_tool": goal_tool,
         "steps": steps,
     }
 
@@ -830,6 +1068,9 @@ def main():
         )
         st.caption("Examples: holding risk / positive catalysts / earnings signals / regulation and lawsuits")
         max_headlines = st.slider("Headlines to analyze", 6, 30, 16)
+        use_llm = st.checkbox("Use LLM for goal analysis and memo", value=True)
+        llm_model = st.text_input("LLM model", get_config_value("OPENAI_MODEL", DEFAULT_LLM_MODEL))
+        st.caption("Set OPENAI_API_KEY in your environment or Streamlit secrets. Without it, the app uses rule-based fallback.")
         allow_fallback_data = st.checkbox("Use offline sample data if live fetch fails", value=False)
         run_button = st.button("Run Agent Workflow")
 
@@ -839,7 +1080,14 @@ def main():
             return
 
         with st.spinner("StockPilot Agent 正在运行..."):
-            result = run_workflow(ticker, mission, max_headlines, allow_fallback_data)
+            result = run_workflow(
+                ticker,
+                mission,
+                max_headlines,
+                allow_fallback_data,
+                use_llm,
+                llm_model,
+            )
 
         st.caption(result["source_note"])
         render_agent_steps(result["steps"])
