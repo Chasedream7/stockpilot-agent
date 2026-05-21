@@ -32,10 +32,20 @@ Instead of only showing a sentiment chart, the app shows a multi-step workflow:
 - Risk Agent: extracts warning signals.
 - Portfolio Copilot: writes the final decision memo.
 
+The Briefing Agent and Portfolio Copilot can use an LLM when `OPENAI_API_KEY` is configured. If no key is available, the app automatically falls back to the rule-based workflow.
+
 ## Run Locally
 
 ```bash
 pip install -r requirements.txt
+streamlit run app.py
+```
+
+Optional LLM mode:
+
+```bash
+export OPENAI_API_KEY="your_api_key"
+export OPENAI_MODEL="gpt-4o-mini"
 streamlit run app.py
 ```
 
