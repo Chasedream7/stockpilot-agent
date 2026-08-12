@@ -300,12 +300,24 @@ def fetch_finviz_soup(ticker):
 
 
 def parse_snapshot(soup):
-    table = soup.find("table", class_="snapshot-table2")
-    if not table:
+    tables = soup.find_all("table", class_="snapshot-table2")
+    if not tables:
         return {}
 
-    cells = [cell.get_text(" ", strip=True) for cell in table.find_all("td")]
-    return {cells[i]: cells[i + 1] for i in range(0, len(cells) - 1, 2)}
+    snapshot = {}
+    for table in tables:
+        for row in table.find_all("tr"):
+            cells = [cell.get_text(" ", strip=True) for cell in row.find_all("td")]
+            for index in range(0, len(cells) - 1, 2):
+                key = cells[index]
+                value = cells[index + 1]
+                if key:
+                    snapshot[key] = value
+
+    if "Change" not in snapshot and "Change %" in snapshot:
+        snapshot["Change"] = snapshot["Change %"]
+
+    return snapshot
 
 
 def normalize_finviz_date(date_text):
