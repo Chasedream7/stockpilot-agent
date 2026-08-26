@@ -1,0 +1,19 @@
+{
+  "evaluation_version": "v2_explicit_business_questions",
+  "run_mode": "llm_fixture",
+  "model": "deepseek-v4-flash",
+  "started_at": "2026-08-26",
+  "status": "partial_saved_progress",
+  "completed_before_interruption": 23,
+  "completed_in_resume_batch": 5,
+  "completed_total": 28,
+  "full_summary_written": false,
+  "api_key_persisted": false,
+  "api_key_in_traces": false,
+  "notes": [
+    "The first 23 traces are in evaluation/results/llm_20260826/traces.",
+    "The resumed A04 and M01-M04 results are in evaluation/results/llm_20260826_resume.",
+    "The original all-case summary was not written because the process was interrupted before its final aggregation step.",
+    "Local embedding downloads were disabled for this LLM run because Hugging Face was unreachable; DeepSeek Supervisor, memo generation, and Critic calls remained enabled."
+  ]
+}
