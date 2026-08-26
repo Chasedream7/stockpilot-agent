@@ -2258,14 +2258,6 @@ def render_dashboard(result):
         )
 
 
-def render_empty_state():
-    st.info("Enter a stock ticker, then ask an initial research question in the chat box.")
-    col1, col2, col3 = st.columns(3)
-    col1.markdown("**1. 自主选工具**\n\nSupervisor 从完整工具列表决定先查新闻还是 SEC。")
-    col2.markdown("**2. 保留研究记忆**\n\n后续追问会复用上轮证据与 memo，而不是从头开始。")
-    col3.markdown("**3. 带证据输出**\n\nCritic 只在发现缺口时触发补充检索。")
-
-
 def main():
     st.set_page_config(page_title="StockPilot Agent", layout="wide")
 
@@ -2330,9 +2322,6 @@ def main():
         st.session_state.agent_memory = None
         st.session_state.last_result = None
         st.info("已因 ticker 变更创建新的研究会话。")
-
-    if not st.session_state.messages:
-        render_empty_state()
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
