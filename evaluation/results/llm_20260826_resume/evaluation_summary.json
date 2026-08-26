@@ -1,0 +1,83 @@
+{
+  "evaluation_version": "v2_explicit_business_questions",
+  "sample_count": 5,
+  "run_mode": "llm_fixture",
+  "llm_model": "deepseek-v4-flash",
+  "mean_total_score": 81.68,
+  "mean_route_score": 95.0,
+  "mean_quality_score": 82.6,
+  "mean_followup_alignment_score": 100.0,
+  "low_score_sample_ids": [
+    "A04",
+    "M04"
+  ],
+  "business_questions": {
+    "Q1_primary_source": {
+      "question": "财报、指引、监管类问题中，Agent 是否成功补到 SEC 一手来源；若检索失败，Critic 是否识别证据缺口？",
+      "sec_fetch_attempt_rate": 100.0,
+      "successful_primary_source_acquisition_rate": 100.0,
+      "critic_failure_detection_rate": 100.0,
+      "success_fixture_case_ids": [
+        "M01"
+      ],
+      "failure_fixture_case_ids": [
+        "A04",
+        "M04"
+      ]
+    },
+    "Q2_ambiguous_input": {
+      "question": "面对模糊或极短输入，Agent 是路径判断错误，还是路径正确但证据不足？",
+      "route_evidence_matrix": {
+        "route_incorrect_evidence_insufficient": 1
+      },
+      "route_correct_rate": 0.0,
+      "evidence_sufficient_rate": 0.0,
+      "case_ids": [
+        "A04"
+      ]
+    },
+    "Q3_critic_followup_calibration": {
+      "question": "Critic 对用户下一句话（accept / ask_for_evidence / retry）的预测，与人工标注的预期反应有多大偏差？",
+      "prediction_accuracy": 100.0,
+      "mismatch_count": 0,
+      "confusion_matrix_expected_by_predicted": {
+        "accept": {
+          "accept": 3,
+          "ask_for_evidence": 0,
+          "retry": 0
+        },
+        "ask_for_evidence": {
+          "accept": 0,
+          "ask_for_evidence": 2,
+          "retry": 0
+        },
+        "retry": {
+          "accept": 0,
+          "ask_for_evidence": 0,
+          "retry": 0
+        }
+      },
+      "annotation_note": "预期反应是 case 作者的盲标代理，不等同于线上真实用户反馈。"
+    },
+    "Q4_first_tool_selection": {
+      "question": "首次研究时，Supervisor 是否从完整工具列表中为任务选择合适的第一项证据工具？",
+      "first_action_alignment_rate": 0.0,
+      "case_ids": [
+        "A04"
+      ],
+      "interpretation_note": "该数值来自固定模型、固定 prompt 的 LLM 运行。"
+    },
+    "Q5_followup_memory": {
+      "question": "追问时，Agent 是否先用 Critic 检查历史证据、复用已有研究，并且只补当前缺口？",
+      "first_self_check_rate": 100.0,
+      "evidence_reuse_without_reanalysis_rate": 100.0,
+      "gap_only_sec_fetch_alignment_rate": 100.0,
+      "case_ids": [
+        "M01",
+        "M02",
+        "M03",
+        "M04"
+      ]
+    }
+  }
+}
