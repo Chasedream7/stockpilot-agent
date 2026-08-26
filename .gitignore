@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 traces/
 evaluation/results/traces/
+evaluation/results/**/traces/
