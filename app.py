@@ -1943,7 +1943,13 @@ def execute_tool(
             duration_ms=duration_ms,
         )
         state["tool_steps"] += 1
-        return {"agent": agent, "tool": tool_label, "output": detail, "action": action}
+        return {
+            "agent": agent,
+            "tool": tool_label,
+            "output": detail,
+            "raw_output": output,
+            "action": action,
+        }
     except Exception as error:
         trace.record(
             "tool_failed",
@@ -2035,6 +2041,7 @@ def run_workflow(
                 f"{'原因：' + goal_profile.get('llm_reason', '') if goal_profile.get('llm_reason') else ''}"
             ),
             "action": "analyze_goal",
+            "raw_output": goal_profile,
         }
     ]
     initial_llm_disabled_reason = goal_profile.get("llm_disabled_reason")
@@ -2085,19 +2092,21 @@ def run_workflow(
                     "tool": "Finish",
                     "output": f"结束本次分析：{terminal_reason}",
                     "action": "finish",
+                    "decision_reason": decision["reason"],
                 }
             )
             break
-        steps.append(
-            execute_tool(
-                decision["action"],
-                state,
-                llm_active,
-                llm_model,
-                trace,
-                api_key=api_key,
-            )
+        step_result = execute_tool(
+            decision["action"],
+            state,
+            llm_active,
+            llm_model,
+            trace,
+            api_key=api_key,
         )
+        step_result["decision_reason"] = decision["reason"]
+        step_result["decision_source"] = decision.get("decision_source")
+        steps.append(step_result)
     else:
         terminal_reason = f"达到 {MAX_AGENT_STEPS} 步上限，为防止循环而停止。"
         steps.append(
@@ -2106,6 +2115,7 @@ def run_workflow(
                 "tool": "Safety stop",
                 "output": terminal_reason,
                 "action": "safety_stop",
+                "decision_reason": terminal_reason,
             }
         )
 
@@ -2154,10 +2164,27 @@ def run_workflow(
 
 
 def render_agent_steps(steps):
-    st.caption("每一步保留决策理由与工具输出，默认收起以避免打断研究结论。")
+    st.caption("以下展示每个 Agent 的决策理由、工具标签和完整结构化输出，便于录屏与复盘。")
     for index, step in enumerate(steps, start=1):
-        with st.expander(f"{index}. {step['agent']} · {step['tool']}", expanded=False):
+        with st.expander(f"{index}. {step['agent']} · {step['tool']}", expanded=True):
             st.markdown(step["output"])
+            if step.get("decision_reason"):
+                st.markdown("**Supervisor 决策理由**")
+                st.info(step["decision_reason"])
+            if step.get("raw_output") is not None:
+                st.markdown("**完整工具输出**")
+                raw_output = step["raw_output"]
+                if isinstance(raw_output, dict) and "headlines" in raw_output:
+                    headlines = raw_output["headlines"]
+                    if isinstance(headlines, pd.DataFrame):
+                        st.dataframe(headlines, use_container_width=True, hide_index=True)
+                    remainder = {key: value for key, value in raw_output.items() if key != "headlines"}
+                    if remainder:
+                        st.json(remainder)
+                elif isinstance(raw_output, pd.DataFrame):
+                    st.dataframe(raw_output, use_container_width=True, hide_index=True)
+                else:
+                    st.json(raw_output)
 
 
 def render_metrics(result):
