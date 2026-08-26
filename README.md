@@ -77,9 +77,9 @@ DeepSeek 官方 API 未提供 embeddings 端点，所以语义路由不再调用
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖两条可复现路径：通用风险问题的短路径，以及 Critic 触发 SEC 补证据、修订 memo 的长路径。
+测试覆盖可复现的首次研究短/长路径，以及追问时复用历史证据、只补 SEC 缺口的多轮路径。
 
-生成 24 条 trace-based 评估基线：
+生成 28 条 trace-based 评估（24 条首次研究 + 4 条多轮追问），显式回答 SEC 一手来源、模糊输入、Critic 校准、自主首工具选择和研究记忆五个问题：
 
 ```bash
 python evaluation/run_evaluation.py
