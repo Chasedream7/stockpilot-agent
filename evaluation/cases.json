@@ -1,0 +1,30 @@
+[
+  {"sample_id": "R01", "scenario": "generic_risk", "ticker": "AAPL", "mission": "判断近期是否有值得记录的风险信号", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "明确风险目标"},
+  {"sample_id": "R02", "scenario": "generic_risk", "ticker": "MSFT", "mission": "我需要一份适合投资日志的近期风险摘要", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "投资日志产物"},
+  {"sample_id": "R03", "scenario": "generic_risk", "ticker": "NVDA", "mission": "最近新闻里有没有影响长期逻辑的负面信号？", "max_headlines": 6, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "长线风险问题"},
+  {"sample_id": "R04", "scenario": "generic_risk", "ticker": "TSLA", "mission": "帮我做一次综合持仓观察", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "宽泛但有目标"},
+  {"sample_id": "R05", "scenario": "generic_risk", "ticker": "AMZN", "mission": "风险和市场情绪是否一致？", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "双信号问题"},
+  {"sample_id": "R06", "scenario": "generic_risk", "ticker": "META", "mission": "", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "空目标，应走默认观察"},
+
+  {"sample_id": "E01", "scenario": "earnings_guidance", "ticker": "AAPL", "mission": "复盘最近财报指引是否改变长期持仓逻辑", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "财报 + 指引 + 长线"},
+  {"sample_id": "E02", "scenario": "earnings_guidance", "ticker": "MSFT", "mission": "营收和利润趋势是否支持原来的增长假设？", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "营收、利润"},
+  {"sample_id": "E03", "scenario": "earnings_guidance", "ticker": "NVDA", "mission": "下一次 earnings 前，我应该重点核对哪些业绩信号？", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "英文 earnings"},
+  {"sample_id": "E04", "scenario": "earnings_guidance", "ticker": "TSLA", "mission": "管理层指引和近期报道有冲突吗？", "max_headlines": 6, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "管理层披露核验"},
+  {"sample_id": "E05", "scenario": "earnings_guidance", "ticker": "AMZN", "mission": "财报发布后需要更新哪些盈利能力风险？", "max_headlines": 5, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "低新闻量"},
+  {"sample_id": "E06", "scenario": "earnings_guidance", "ticker": "PRIVATE", "mission": "财报和指引有没有改变持仓判断？", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "fail", "coverage_note": "一手来源补检索失败"},
+
+  {"sample_id": "L01", "scenario": "regulation_legal", "ticker": "META", "mission": "最近的监管和诉讼风险是否需要升级关注？", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "监管 + 诉讼"},
+  {"sample_id": "L02", "scenario": "regulation_legal", "ticker": "GOOGL", "mission": "反垄断调查对原有 thesis 的影响要怎么复盘？", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "监管同义表达"},
+  {"sample_id": "L03", "scenario": "regulation_legal", "ticker": "TSLA", "mission": "公司公告或 filing 中是否出现需追踪的合规事项？", "max_headlines": 8, "expects_primary_source": true, "sec_mode": "success", "coverage_note": "filing 英文触发词"},
+  {"sample_id": "L04", "scenario": "regulation_legal", "ticker": "PRIVATE", "mission": "调查事件是否属于重大监管风险？", "max_headlines": 6, "expects_primary_source": true, "sec_mode": "fail", "coverage_note": "监管问题且 SEC 失败"},
+
+  {"sample_id": "C01", "scenario": "catalyst_competition", "ticker": "NVDA", "mission": "扫描近期增长催化和竞争压力", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "正面与竞争并存"},
+  {"sample_id": "C02", "scenario": "catalyst_competition", "ticker": "AAPL", "mission": "需求和市场份额新闻有没有改变产品增长叙事？", "max_headlines": 8, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "需求/竞争"},
+  {"sample_id": "C03", "scenario": "catalyst_competition", "ticker": "AMZN", "mission": "找近期的正面催化，但不要给买卖建议", "max_headlines": 6, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "合规表达约束"},
+  {"sample_id": "C04", "scenario": "catalyst_competition", "ticker": "MSFT", "mission": "竞争对手和宏观压力哪个更值得跟踪？", "max_headlines": 5, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "优先级比较"},
+
+  {"sample_id": "A01", "scenario": "ambiguous_low_context", "ticker": "META", "mission": "帮我看看", "max_headlines": 4, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "极模糊指令 + 少量证据"},
+  {"sample_id": "A02", "scenario": "ambiguous_low_context", "ticker": "TSLA", "mission": "这个波动要紧吗？", "max_headlines": 4, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "指代不清"},
+  {"sample_id": "A03", "scenario": "ambiguous_low_context", "ticker": "AMZN", "mission": "有风险吗，快一点", "max_headlines": 3, "expects_primary_source": false, "sec_mode": "not_applicable", "coverage_note": "短指令 + 低证据量"},
+  {"sample_id": "A04", "scenario": "ambiguous_low_context", "ticker": "PRIVATE", "mission": "公司监管风险怎么样？", "max_headlines": 3, "expects_primary_source": true, "sec_mode": "fail", "coverage_note": "模糊监管问题 + 一手来源失败"}
+]
