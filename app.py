@@ -907,18 +907,38 @@ def infer_goal_profile_with_embedding(mission, trace=None):
     if not query_vectors or not profile_vectors or len(profile_vectors) != len(profiles):
         return None
     similarities = [cosine_similarity(query_vectors[0], vector) for vector in profile_vectors]
-    best_index = max(range(len(profiles)), key=lambda index: similarities[index])
+    normalized_mission = mission.lower()
+    explicit_matches = [
+        sum(1 for keyword in profile.get("keywords", []) if keyword.lower() in normalized_mission)
+        for profile in profiles
+    ]
+    # Keep embedding as the main signal, but let explicit high-signal intent words
+    # break near-ties. This prevents generic words such as "长期" or "复盘" from
+    # hiding a clear follow-up focus like "监管 / 反垄断 / 调查".
+    adjusted_scores = [
+        similarity + min(0.18, match_count * 0.06)
+        for similarity, match_count in zip(similarities, explicit_matches)
+    ]
+    best_index = max(range(len(profiles)), key=lambda index: adjusted_scores[index])
     profile = dict(profiles[best_index])
     alternatives = sorted(
         (
-            {"profile_key": candidate["key"], "similarity": round(similarities[index], 3)}
+            {
+                "profile_key": candidate["key"],
+                "similarity": round(similarities[index], 3),
+                "explicit_matches": explicit_matches[index],
+                "adjusted_score": round(adjusted_scores[index], 3),
+            }
             for index, candidate in enumerate(profiles)
         ),
-        key=lambda item: item["similarity"],
+        key=lambda item: item["adjusted_score"],
         reverse=True,
     )[:3]
     profile["analysis_source"] = "Local embedding semantic router"
-    profile["llm_reason"] = f"本地语义相似度 {similarities[best_index]:.3f}，最接近“{profile['label']}”。"
+    profile["llm_reason"] = (
+        f"本地语义相似度 {similarities[best_index]:.3f}，"
+        f"显式意图词 {explicit_matches[best_index]} 个，最接近“{profile['label']}”。"
+    )
     if trace:
         trace.record(
             "semantic_match",
