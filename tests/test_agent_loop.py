@@ -122,6 +122,9 @@ class AgentLoopTest(unittest.TestCase):
         )
         self.assertIs(follow_up["memory"]["news_df"], first["memory"]["news_df"])
         self.assertEqual(follow_up["critic"]["status"], "pass")
+        self.assertGreater(follow_up["memo"].count("本轮追问回答"), 0)
+        self.assertIn("详细说说那个监管风险", follow_up["memo"])
+        self.assertNotEqual(follow_up["memo"], first["memo"])
 
 
 class SemanticRoutingTest(unittest.TestCase):
