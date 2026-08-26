@@ -1,0 +1,15 @@
+{
+  "sample_count": 24,
+  "run_mode": "rule_fixture_baseline",
+  "mean_total_score": 87.33,
+  "mean_route_score": 98.54,
+  "mean_quality_score": 83.67,
+  "mean_satisfaction_score": 100.0,
+  "low_score_sample_ids": [
+    "E06",
+    "L02",
+    "L04",
+    "A03",
+    "A04"
+  ]
+}
