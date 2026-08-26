@@ -31,8 +31,10 @@ FINVIZ_URL = "https://finviz.com/quote.ashx?t="
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
-DEFAULT_LLM_MODEL = "gpt-4o-mini"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+COMPASS_BASE_URL = "https://compass.llm.shopee.io/compass-api/v1"
+DEFAULT_LLM_MODEL = "compass-v2"
+DEFAULT_EMBEDDING_MODEL = "compass-embedding-v3"
+COMPASS_EMBEDDING_DIMENSIONS = 384
 TRACE_SCHEMA_VERSION = "1.0"
 MAX_AGENT_STEPS = 10
 RISK_SEMANTIC_THRESHOLD = 0.35
@@ -344,13 +346,13 @@ def get_config_value(name, default=None):
         return default
 
 
-def get_openai_client(api_key=None):
+def get_compass_client(api_key=None):
     if OpenAI is None or not api_key:
         return None
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key, base_url=COMPASS_BASE_URL)
 
 
-def is_openai_capacity_error(error):
+def is_llm_capacity_error(error):
     """Whether an SDK error means this run should stop making paid API calls."""
     status_code = getattr(error, "status_code", None)
     error_type = type(error).__name__.lower()
@@ -359,13 +361,13 @@ def is_openai_capacity_error(error):
 
 def llm_failure_notice(error):
     """A user-safe message; never echo provider error text or credentials."""
-    if is_openai_capacity_error(error):
+    if is_llm_capacity_error(error):
         return (
-            "OpenAI API 当前返回 429（请求限流或项目额度不可用）。"
-            "本轮已自动切换到规则基线，研究仍会完成；请检查该 API Key 所属项目的 Billing / Limits，"
-            "或等待限流窗口重置后重试。"
+            "Compass LLM 当前返回 429（请求限流、项目配额或模型权限不可用）。"
+            "本轮已自动切换到规则基线，研究仍会完成；请检查 Compass Key 是否已获批、"
+            "项目是否获授权调用所选模型，或等待限流窗口重置后重试。"
         )
-    return "OpenAI API 本轮不可用，已自动切换到规则基线，研究仍会完成。"
+    return "Compass LLM API 本轮不可用，已自动切换到规则基线，研究仍会完成。"
 
 
 def disable_llm_for_run(state, error, trace, stage):
@@ -697,9 +699,15 @@ def extract_usage(response):
     usage = getattr(response, "usage", None)
     if usage is None:
         return {}
+    input_tokens = getattr(usage, "input_tokens", None)
+    if input_tokens is None:
+        input_tokens = getattr(usage, "prompt_tokens", None)
+    output_tokens = getattr(usage, "output_tokens", None)
+    if output_tokens is None:
+        output_tokens = getattr(usage, "completion_tokens", None)
     return {
-        "input_tokens": getattr(usage, "input_tokens", None),
-        "output_tokens": getattr(usage, "output_tokens", None),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "total_tokens": getattr(usage, "total_tokens", None),
     }
 
@@ -729,13 +737,17 @@ def cosine_similarity(left, right):
 
 def embed_texts(texts, api_key, model, trace=None, agent="Embedding Router", step="embedding"):
     """Create a small batch of vectors and trace metadata, never vectors or API keys."""
-    client = get_openai_client(api_key)
+    client = get_compass_client(api_key)
     if client is None:
         return None
 
     started_at = time.perf_counter()
     try:
-        response = client.embeddings.create(model=model, input=texts)
+        response = client.embeddings.create(
+            model=model,
+            input=texts,
+            dimensions=COMPASS_EMBEDDING_DIMENSIONS,
+        )
         vectors = [item.embedding for item in response.data]
     except Exception as error:
         if trace:
@@ -771,20 +783,27 @@ def call_llm_text(
     step="llm_call",
     api_key=None,
 ):
-    client = get_openai_client(api_key)
+    client = get_compass_client(api_key)
     if client is None:
         return None
 
     started_at = time.perf_counter()
     try:
-        response = client.responses.create(
+        response = client.chat.completions.create(
             model=model,
-            input=[
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         )
-        output = response.output_text
+        output = response.choices[0].message.content
+        if isinstance(output, list):
+            output = "".join(
+                item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")
+                for item in output
+            )
+        if not output:
+            raise RuntimeError("Compass Chat Completions response did not contain text content.")
     except Exception as error:
         if trace:
             trace.record(
@@ -962,12 +981,12 @@ def analyze_goal(
                     agent="PM Agent",
                     error=error,
                 )
-            if is_openai_capacity_error(error):
+            if is_llm_capacity_error(error):
                 fallback = dict(infer_goal_profile(mission))
                 fallback["analysis_source"] = "Rule fallback"
                 fallback["llm_reason"] = "Embedding 服务不可用，已跳过后续 LLM 调用。"
                 fallback["llm_disabled_reason"] = llm_failure_notice(error)
-                return fallback, "Rule fallback after OpenAI 429"
+                return fallback, "Rule fallback after Compass 429"
         try:
             profile = infer_goal_profile_with_llm(mission, model, trace=trace, api_key=api_key)
             if profile:
@@ -982,7 +1001,7 @@ def analyze_goal(
     profile = dict(infer_goal_profile(mission))
     profile["analysis_source"] = "Rule fallback"
     if use_llm:
-        profile["llm_reason"] = "未输入 API Key 或 openai package 不可用。"
+        profile["llm_reason"] = "未输入 Compass API Key 或 openai SDK 不可用。"
         return profile, "Rule fallback because LLM is unavailable"
     profile["llm_reason"] = "LLM mode is off."
     return profile, "Rule-based goal parser"
@@ -1567,7 +1586,7 @@ def decide_next_action(state, use_llm, model, trace, api_key=None):
     available = valid_actions(state)
     if fallback_action not in available:
         fallback_action = available[0]
-    if not use_llm or get_openai_client(api_key) is None:
+    if not use_llm or get_compass_client(api_key) is None:
         decision = {
             "action": fallback_action,
             "reason": fallback_reason,
@@ -1700,7 +1719,7 @@ def fallback_critic_check(state):
 
 
 def self_check_memo(state, use_llm, model, trace, api_key=None):
-    if not use_llm or get_openai_client(api_key) is None:
+    if not use_llm or get_compass_client(api_key) is None:
         return fallback_critic_check(state)
 
     system_prompt = """
@@ -2286,17 +2305,17 @@ def main():
         max_headlines = st.slider("Headlines to analyze", 6, 30, 16)
         use_llm = st.checkbox("Use LLM for goal analysis and memo", value=True)
         api_key = st.text_input(
-            "OpenAI API key",
+            "Compass API key",
             type="password",
             disabled=not use_llm,
-            help="仅在当前浏览器会话中用于本次请求；不会写入 trace、文件或环境变量。",
+            help="填写已获批的 Compass DQP/SQP Key；仅用于当前浏览器会话，不会写入 trace、文件或环境变量。",
         )
-        llm_model = st.text_input("LLM model", DEFAULT_LLM_MODEL, disabled=not use_llm)
+        llm_model = st.text_input("Compass chat model", DEFAULT_LLM_MODEL, disabled=not use_llm)
         embedding_model = st.text_input(
-            "Embedding model", DEFAULT_EMBEDDING_MODEL, disabled=not use_llm
+            "Compass embedding model", DEFAULT_EMBEDDING_MODEL, disabled=not use_llm
         )
         st.caption(
-            "密钥仅保留在当前浏览器会话中。开启 LLM 时，会用 embedding 对目标和新闻风险做语义匹配；关闭或刷新页面后需重新输入密钥。"
+            "调用 Compass Chat Completions 与 Embeddings API。Key 必须已完成 DQP/SQP 审批并有模型权限；关闭或刷新页面后需重新输入。"
         )
         allow_fallback_data = st.checkbox("Use offline sample data if live fetch fails", value=False)
         if st.button("New research conversation"):
@@ -2325,7 +2344,7 @@ def main():
             st.warning("Please enter a stock ticker.")
             return
         if use_llm and not api_key.strip():
-            st.warning("请输入 OpenAI API key，或关闭 LLM 模式后使用规则基线运行。")
+            st.warning("请输入已获批的 Compass API key，或关闭 LLM 模式后使用规则基线运行。")
             return
 
         st.session_state.messages.append({"role": "user", "content": mission})
