@@ -52,7 +52,7 @@ Supervisor Agent（每轮查看完整工具 manifest，再从当前满足前置�
 - `input`、简短的 `decision` justification、`tool_call`、`output`
 - `duration_ms` / `elapsed_ms`、LLM `input_tokens` / `output_tokens` / `total_tokens`
 - `error`，以及 Critic 对用户下一句话的预测：`accept` / `ask_for_evidence` / `retry`
-- embedding 的模型、输入文本摘要、耗时与 token；**不记录 API key 或向量值**
+- 本地 embedding 的模型、输入数量与耗时；**不记录 API key 或向量值**
 
 这使得后续可以从 trace 计算工具路径正确性、回答与证据完整性、用户满意度代理信号、时延和 token 成本；也能逐条回放低分 case。
 
@@ -63,9 +63,11 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-可选的 LLM 模式不需要在本机配置 API Key：启动页面后，在侧边栏输入已获批的 Compass DQP/SQP Key 即可。应用使用 OpenAI Python SDK 的兼容模式，但请求会发送到 Compass 的 `https://compass.llm.shopee.io/compass-api/v1`，通过 `chat.completions` 调用 `compass-v2`；密钥只用于当前浏览器会话，不会写入 trace、文件或环境变量。
+可选的 LLM 模式不需要在本机配置 API Key：启动页面后，在侧边栏输入 DeepSeek API Key 即可。密钥只用于当前浏览器会话，不会写入 trace、文件或环境变量。
 
-默认 embedding 模型是 `compass-embedding-v3`（384 维），可以在同一侧边栏更换。输入目标和新闻标题会发送给该模型，用于语义分类。Compass Key 需要完成 DQP/SQP 审批，并具备所选模型的调用权限。
+应用通过 OpenAI Python SDK 的兼容模式调用 `https://api.deepseek.com/chat/completions`。默认文本模型为 `deepseek-v4-flash`，可在侧边栏改为 `deepseek-v4-pro`。DeepSeek 负责 Supervisor、Critic 和 memo 等文本推理。
+
+DeepSeek 官方 API 未提供 embeddings 端点，所以语义路由不再调用其他云端模型：应用首次启动时会下载免费的本地模型 `intfloat/multilingual-e5-small`（MIT、94 种语言、384 维），之后在部署机器上计算中文目标与英文新闻标题的向量。它不需要额外 API Key 或按量付费；无法加载时才回退到关键词规则。
 
 规则基线模式无需 API Key。`STOCKPILOT_CONTACT_EMAIL`（可选）用于标识 SEC EDGAR 请求；也可用 `STOCKPILOT_TRACE_DIR` 改变 trace 的保存目录。
 
