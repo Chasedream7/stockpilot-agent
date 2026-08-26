@@ -350,6 +350,42 @@ def get_openai_client(api_key=None):
     return OpenAI(api_key=api_key)
 
 
+def is_openai_capacity_error(error):
+    """Whether an SDK error means this run should stop making paid API calls."""
+    status_code = getattr(error, "status_code", None)
+    error_type = type(error).__name__.lower()
+    return status_code == 429 or "ratelimit" in error_type or "quota" in error_type
+
+
+def llm_failure_notice(error):
+    """A user-safe message; never echo provider error text or credentials."""
+    if is_openai_capacity_error(error):
+        return (
+            "OpenAI API 当前返回 429（请求限流或项目额度不可用）。"
+            "本轮已自动切换到规则基线，研究仍会完成；请检查该 API Key 所属项目的 Billing / Limits，"
+            "或等待限流窗口重置后重试。"
+        )
+    return "OpenAI API 本轮不可用，已自动切换到规则基线，研究仍会完成。"
+
+
+def disable_llm_for_run(state, error, trace, stage):
+    """Trip a per-run circuit breaker after an API failure and leave an audit trail."""
+    notice = llm_failure_notice(error)
+    if state.get("llm_disabled_reason"):
+        return state["llm_disabled_reason"]
+
+    state["llm_disabled_reason"] = notice
+    state.setdefault("warnings", []).append(notice)
+    trace.record(
+        "llm_runtime_disabled",
+        step=state.get("tool_steps", 0),
+        agent="Supervisor Agent",
+        input_data={"stage": stage, "error_type": type(error).__name__},
+        error=error,
+    )
+    return notice
+
+
 @cache_resource
 def get_sentiment_analyzer():
     if nltk is None or SentimentIntensityAnalyzer is None:
@@ -926,6 +962,12 @@ def analyze_goal(
                     agent="PM Agent",
                     error=error,
                 )
+            if is_openai_capacity_error(error):
+                fallback = dict(infer_goal_profile(mission))
+                fallback["analysis_source"] = "Rule fallback"
+                fallback["llm_reason"] = "Embedding 服务不可用，已跳过后续 LLM 调用。"
+                fallback["llm_disabled_reason"] = llm_failure_notice(error)
+                return fallback, "Rule fallback after OpenAI 429"
         try:
             profile = infer_goal_profile_with_llm(mission, model, trace=trace, api_key=api_key)
             if profile:
@@ -933,7 +975,8 @@ def analyze_goal(
         except Exception as error:
             fallback = dict(infer_goal_profile(mission))
             fallback["analysis_source"] = "Rule fallback"
-            fallback["llm_reason"] = f"LLM goal analysis failed: {error}"
+            fallback["llm_reason"] = "LLM 目标分析不可用，已使用规则分类。"
+            fallback["llm_disabled_reason"] = llm_failure_notice(error)
             return fallback, "Rule fallback after LLM error"
 
     profile = dict(infer_goal_profile(mission))
@@ -1194,6 +1237,7 @@ def build_llm_memo(
     sec_filings=None,
     trace=None,
     api_key=None,
+    conversation_history=None,
 ):
     system_prompt = """
 You are Portfolio Copilot inside StockPilot Agent.
@@ -1228,6 +1272,7 @@ Frame conclusions as observation and review guidance, not investment advice.
         "risk_findings": risk["findings"],
         "recent_headlines": compact_headlines(scored_news),
         "sec_filings": sec_filings or {},
+        "conversation_history": compact_conversation(conversation_history),
     }
     user_prompt = f"""
 Create the memo in Markdown with these sections:
@@ -1270,6 +1315,7 @@ def build_memo(
     sec_filings=None,
     trace=None,
     api_key=None,
+    conversation_history=None,
 ):
     if use_llm:
         try:
@@ -1286,6 +1332,7 @@ def build_memo(
                 sec_filings=sec_filings,
                 trace=trace,
                 api_key=api_key,
+                conversation_history=conversation_history,
             )
             if memo:
                 return memo.strip(), "LLM memo generator"
@@ -1376,6 +1423,61 @@ AGENT_TOOLS = {
 }
 
 
+def compact_conversation(messages, max_messages=6, max_chars=900):
+    """Keep the latest conversation turns available to the planner without unbounded prompts."""
+    compacted = []
+    for message in (messages or [])[-max_messages:]:
+        role = message.get("role", "user")
+        content = short_text(message.get("content", ""), max_chars)
+        compacted.append({"role": role, "content": content})
+    return compacted
+
+
+def tool_statuses(state):
+    """Expose the complete manifest while keeping data dependencies explicit."""
+    critic = state.get("critic") or {}
+    needs_unfetched_primary = critic.get("should_retrieve") and not state["sec_attempted"]
+    return {
+        "collect_news": {
+            "available": state["news_df"] is None,
+            "precondition": "没有可用新闻证据。",
+        },
+        "fetch_sec_filings": {
+            "available": not state["sec_attempted"],
+            "precondition": "尚未尝试 SEC 一手披露检索。",
+        },
+        "analyze_sentiment": {
+            "available": state["news_df"] is not None and state["scored_news"] is None,
+            "precondition": "已有新闻、尚未完成情绪量化。",
+        },
+        "assess_risk": {
+            "available": state["scored_news"] is not None and state["risk"] is None,
+            "precondition": "已有情绪新闻、尚未完成风险归纳。",
+        },
+        "draft_memo": {
+            "available": state["risk"] is not None
+            and (state["memo"] is None or state["revision_requested"])
+            and not needs_unfetched_primary,
+            "precondition": "已有风险结论，且没有待补的一手来源。",
+        },
+        "self_check": {
+            "available": state["memo"] is not None
+            and (
+                state["pending_followup_review"]
+                or state["reviewed_memo_version"] != state["memo_version"]
+            ),
+            "precondition": "已有 memo，且当前版本未审查或用户发起了追问。",
+        },
+        "finish": {
+            "available": state["memo"] is not None
+            and not state["pending_followup_review"]
+            and state["reviewed_memo_version"] == state["memo_version"]
+            and not needs_unfetched_primary,
+            "precondition": "当前 memo 已审查，且没有可执行的补证据请求。",
+        },
+    }
+
+
 def mission_needs_primary_source(mission):
     keywords = [
         "财报",
@@ -1421,41 +1523,30 @@ def planner_state(state):
         "memo_reviewed": state["reviewed_memo_version"] == state["memo_version"],
         "critic_status": critic.get("status"),
         "critic_requests_primary_source": critic.get("should_retrieve", False),
+        "is_follow_up": state["is_follow_up"],
+        "pending_followup_review": state["pending_followup_review"],
+        "conversation_turns": len(state["messages"]),
+        "retained_evidence": {
+            "news": state["news_df"] is not None,
+            "risk": state["risk"] is not None,
+            "primary_source": bool((state.get("sec_filings") or {}).get("filings")),
+        },
         "steps_remaining": MAX_AGENT_STEPS - state["tool_steps"],
     }
 
 
 def valid_actions(state):
-    actions = []
-    if state["news_df"] is None:
-        actions.append("collect_news")
-    if not state["sec_attempted"]:
-        actions.append("fetch_sec_filings")
-    if state["news_df"] is not None and state["scored_news"] is None:
-        actions.append("analyze_sentiment")
-    if state["scored_news"] is not None and state["risk"] is None:
-        actions.append("assess_risk")
-    critic_requires_unfetched_source = (
-        (state.get("critic") or {}).get("should_retrieve") and not state["sec_attempted"]
-    )
-    if state["risk"] is not None and (
-        state["memo"] is None or state["revision_requested"]
-    ) and not critic_requires_unfetched_source:
-        actions.append("draft_memo")
-    if state["memo"] is not None and state["reviewed_memo_version"] != state["memo_version"]:
-        actions.append("self_check")
-
-    critic = state.get("critic") or {}
-    reviewed_current_memo = state["reviewed_memo_version"] == state["memo_version"]
-    if state["memo"] is not None and reviewed_current_memo and not (
-        critic.get("should_retrieve") and not state["sec_attempted"]
-    ):
-        actions.append("finish")
-    return actions
+    statuses = tool_statuses(state)
+    if state["pending_followup_review"]:
+        # A follow-up must first inspect the old answer/evidence before it can re-retrieve.
+        return ["self_check"]
+    return [name for name, status in statuses.items() if status["available"]]
 
 
 def rule_next_action(state):
     """Safe deterministic fallback when an LLM is unavailable or emits an invalid action."""
+    if state["pending_followup_review"]:
+        return "self_check", "用户正在追问，先检查历史回答和已有证据的缺口。"
     if state["news_df"] is None:
         return "collect_news", "缺少新闻证据，先建立可分析的事实基础。"
     if (state.get("critic") or {}).get("should_retrieve") and not state["sec_attempted"]:
@@ -1491,11 +1582,20 @@ def decide_next_action(state, use_llm, model, trace, api_key=None):
         )
         return decision
 
+    statuses = tool_statuses(state)
     tool_text = "\n".join(
-        f"- {name}: {AGENT_TOOLS[name]['when']}" for name in available if name in AGENT_TOOLS
+        (
+            f"- {name} ({AGENT_TOOLS[name]['agent']}): {AGENT_TOOLS[name]['when']} "
+            f"| precondition: {status['precondition']} | available_now: {status['available']}"
+        )
+        for name, status in statuses.items()
+        if name in AGENT_TOOLS
     )
-    if "finish" in available:
-        tool_text += "\n- finish: 仅当当前 memo 已被 Critic 审查且不需要补一手证据时。"
+    tool_text += (
+        f"\n- finish (Supervisor Agent): end the run only after review "
+        f"| precondition: {statuses['finish']['precondition']} "
+        f"| available_now: {statuses['finish']['available']}"
+    )
     system_prompt = """
 You are the Supervisor Agent for an evidence-grounded stock research workflow.
 Choose exactly one next action from the available actions. Your job is to adapt the
@@ -1507,24 +1607,43 @@ private chain-of-thought. Return JSON only: {"action": "...", "reason": "..."}.
 Current workflow state:
 {json.dumps(planner_state(state), ensure_ascii=False, indent=2)}
 
-Available actions:
+Conversation history (latest turns):
+{json.dumps(compact_conversation(state['messages']), ensure_ascii=False, indent=2)}
+
+Complete tool manifest:
 {tool_text}
 
 Rules:
-- Use `collect_news` before sentiment/risk/memo whenever no news is available.
-- Use `fetch_sec_filings` for earnings, regulation, filings, or when the Critic asks for a primary source; do not over-retrieve for a generic mood check.
-- Do not choose `draft_memo` until risk analysis is ready.
-- Do not choose `finish` until Critic has checked the current memo.
+- You may reason over every listed tool. Choose exactly one action with `available_now: true`.
+- On a fresh run, choose the evidence source that best fits the mission: news and SEC are both valid first actions when available.
+- On a follow-up with a prior memo, choose `self_check` first; use the conversation and retained evidence to decide whether retrieval is actually missing.
+- Do not restart evidence collection merely because the user asks a follow-up. Prefer the retained evidence unless Critic identifies a gap.
 """.strip()
-    parsed = call_llm_json(
-        system_prompt,
-        user_prompt,
-        model,
-        trace=trace,
-        agent="Supervisor Agent",
-        step=f"planner_{state['tool_steps'] + 1}",
-        api_key=api_key,
-    )
+    try:
+        parsed = call_llm_json(
+            system_prompt,
+            user_prompt,
+            model,
+            trace=trace,
+            agent="Supervisor Agent",
+            step=f"planner_{state['tool_steps'] + 1}",
+            api_key=api_key,
+        )
+    except Exception as error:
+        disable_llm_for_run(state, error, trace, "supervisor_planner")
+        decision = {
+            "action": fallback_action,
+            "reason": fallback_reason,
+            "decision_source": "LLM error fallback",
+        }
+        trace.record(
+            "planner_decision",
+            step=state["tool_steps"] + 1,
+            agent="Supervisor Agent",
+            input_data={"state": planner_state(state), "available_actions": available},
+            decision=decision,
+        )
+        return decision
     action = (parsed or {}).get("action")
     reason = (parsed or {}).get("reason")
     if action not in available:
@@ -1532,7 +1651,7 @@ Rules:
             "planner_decision_rejected",
             step=state["tool_steps"] + 1,
             agent="Supervisor Agent",
-            input_data={"available_actions": available},
+            input_data={"eligible_actions": available, "tool_manifest": statuses},
             decision={"proposed_action": action, "reason": reason},
             error="LLM proposed an unavailable action; safe fallback applied.",
         )
@@ -1545,7 +1664,11 @@ Rules:
         "planner_decision",
         step=state["tool_steps"] + 1,
         agent="Supervisor Agent",
-        input_data={"state": planner_state(state), "available_actions": available},
+        input_data={
+            "state": planner_state(state),
+            "eligible_actions": available,
+            "tool_manifest": statuses,
+        },
         decision=decision,
     )
     return decision
@@ -1590,6 +1713,7 @@ missing_evidence (array), contradictions (array), reason (concise Chinese).
 predicted_user_followup (accept|ask_for_evidence|retry).
 Request SEC filings only when the question or draft makes a material earnings,
 regulatory, filing, or management-disclosure claim that headlines alone cannot support.
+Use the conversation history to resolve references such as "that regulatory risk".
 """.strip()
     evidence = {
         "mission": state["mission"],
@@ -1598,16 +1722,23 @@ regulatory, filing, or management-disclosure claim that headlines alone cannot s
         "risk": state["risk"],
         "sec_filings": state.get("sec_filings") or {},
         "memo": state["memo"],
+        "conversation_history": compact_conversation(state["messages"]),
     }
-    parsed = call_llm_json(
-        system_prompt,
-        json.dumps(evidence, ensure_ascii=False, indent=2),
-        model,
-        trace=trace,
-        agent="Critic Agent",
-        step=f"self_check_{state['memo_version']}",
-        api_key=api_key,
-    )
+    try:
+        parsed = call_llm_json(
+            system_prompt,
+            json.dumps(evidence, ensure_ascii=False, indent=2),
+            model,
+            trace=trace,
+            agent="Critic Agent",
+            step=f"self_check_{state['memo_version']}",
+            api_key=api_key,
+        )
+    except Exception as error:
+        disable_llm_for_run(state, error, trace, "critic_self_check")
+        fallback = fallback_critic_check(state)
+        fallback["judge_source"] = "Rule fallback after LLM error"
+        return fallback
     if not parsed or parsed.get("status") not in {"pass", "needs_more_evidence"}:
         fallback = fallback_critic_check(state)
         fallback["judge_source"] = "LLM invalid-output fallback"
@@ -1737,6 +1868,7 @@ def execute_tool(
                 sec_filings=state.get("sec_filings"),
                 trace=trace,
                 api_key=api_key,
+                conversation_history=state["messages"],
             )
             state["memo"] = memo
             state["memo_tool"] = tool_label
@@ -1746,9 +1878,14 @@ def execute_tool(
             output = {"memo_version": state["memo_version"], "memo": memo, "generator": tool_label}
 
         elif action == "self_check":
+            was_followup_review = state["pending_followup_review"]
             state["critic"] = self_check_memo(state, use_llm, model, trace, api_key=api_key)
             state["reviewed_memo_version"] = state["memo_version"]
+            state["pending_followup_review"] = False
             state["revision_requested"] = bool(state["critic"].get("should_retrieve")) and not state["sec_attempted"]
+            if was_followup_review and not state["critic"].get("should_retrieve"):
+                # The user asked a new question; answer it with retained evidence even when no retrieval is needed.
+                state["revision_requested"] = True
             detail = (
                 f"Critic 评估：{state['critic']['status']}，"
                 f"答案分 {state['critic']['answer_score']}，证据分 {state['critic']['evidence_score']}。"
@@ -1782,6 +1919,27 @@ def execute_tool(
         raise
 
 
+def build_conversation_memory(state):
+    """Keep structured evidence in Streamlit session state for follow-up questions."""
+    fields = [
+        "ticker",
+        "source_note",
+        "snapshot",
+        "news_df",
+        "scored_news",
+        "summary",
+        "risk",
+        "sec_filings",
+        "sec_attempted",
+        "memo",
+        "memo_tool",
+        "memo_version",
+        "reviewed_memo_version",
+        "critic",
+    ]
+    return {field: state.get(field) for field in fields}
+
+
 def run_workflow(
     ticker,
     mission,
@@ -1792,8 +1950,13 @@ def run_workflow(
     trace_dir=None,
     api_key=None,
     embedding_model=DEFAULT_EMBEDDING_MODEL,
+    prior_memory=None,
+    messages=None,
 ):
     """Run an inspectable supervisor loop instead of a fixed, always-five-step pipeline."""
+    prior_memory = prior_memory if (prior_memory or {}).get("ticker") == ticker else None
+    is_follow_up = bool(prior_memory and prior_memory.get("memo"))
+    messages = compact_conversation(messages)
     trace = TraceLogger(trace_dir=trace_dir)
     trace.record(
         "run_started",
@@ -1807,6 +1970,8 @@ def run_workflow(
             "llm_enabled": use_llm,
             "llm_model": llm_model,
             "embedding_model": embedding_model,
+            "is_follow_up": is_follow_up,
+            "conversation_turns": len(messages),
         },
     )
     goal_started_at = time.perf_counter()
@@ -1838,32 +2003,46 @@ def run_workflow(
             "action": "analyze_goal",
         }
     ]
+    initial_llm_disabled_reason = goal_profile.get("llm_disabled_reason")
     state = {
         "ticker": ticker,
         "mission": mission,
         "max_headlines": max_headlines,
         "allow_fallback_data": allow_fallback_data,
         "goal_profile": goal_profile,
-        "source_note": "Evidence has not been collected yet.",
-        "snapshot": {},
-        "news_df": None,
-        "scored_news": None,
-        "summary": None,
-        "risk": None,
-        "sec_filings": None,
-        "sec_attempted": False,
-        "memo": None,
-        "memo_tool": None,
-        "memo_version": 0,
-        "reviewed_memo_version": 0,
+        "source_note": (prior_memory or {}).get("source_note", "Evidence has not been collected yet."),
+        "snapshot": (prior_memory or {}).get("snapshot", {}),
+        "news_df": (prior_memory or {}).get("news_df"),
+        "scored_news": (prior_memory or {}).get("scored_news"),
+        "summary": (prior_memory or {}).get("summary"),
+        "risk": (prior_memory or {}).get("risk"),
+        "sec_filings": (prior_memory or {}).get("sec_filings"),
+        "sec_attempted": (prior_memory or {}).get("sec_attempted", False),
+        "memo": (prior_memory or {}).get("memo"),
+        "memo_tool": (prior_memory or {}).get("memo_tool"),
+        "memo_version": (prior_memory or {}).get("memo_version", 0),
+        "reviewed_memo_version": (prior_memory or {}).get("reviewed_memo_version", 0),
         "revision_requested": False,
-        "critic": None,
+        "critic": (prior_memory or {}).get("critic"),
         "tool_steps": 0,
+        "is_follow_up": is_follow_up,
+        "pending_followup_review": is_follow_up,
+        "messages": messages,
+        "llm_disabled_reason": initial_llm_disabled_reason,
+        "warnings": [initial_llm_disabled_reason] if initial_llm_disabled_reason else [],
     }
+    if initial_llm_disabled_reason:
+        trace.record(
+            "llm_runtime_disabled",
+            step=0,
+            agent="PM Agent",
+            input_data={"stage": "goal_analysis", "reason": initial_llm_disabled_reason},
+        )
 
     terminal_reason = ""
     while state["tool_steps"] < MAX_AGENT_STEPS:
-        decision = decide_next_action(state, use_llm, llm_model, trace, api_key=api_key)
+        llm_active = use_llm and not state["llm_disabled_reason"]
+        decision = decide_next_action(state, llm_active, llm_model, trace, api_key=api_key)
         if decision["action"] == "finish":
             terminal_reason = decision["reason"]
             steps.append(
@@ -1879,7 +2058,7 @@ def run_workflow(
             execute_tool(
                 decision["action"],
                 state,
-                use_llm,
+                llm_active,
                 llm_model,
                 trace,
                 api_key=api_key,
@@ -1915,6 +2094,7 @@ def run_workflow(
             "memo_version": state["memo_version"],
             "critic": state["critic"],
             "source_note": state["source_note"],
+            "llm_disabled_reason": state["llm_disabled_reason"],
         },
     )
     return {
@@ -1935,6 +2115,8 @@ def run_workflow(
         "trace_path": str(trace.path),
         "trace_run_id": trace.run_id,
         "terminal_reason": terminal_reason,
+        "warnings": state["warnings"],
+        "memory": build_conversation_memory(state),
     }
 
 
@@ -2058,11 +2240,11 @@ def render_dashboard(result):
 
 
 def render_empty_state():
-    st.info("Enter a stock ticker and analysis goal, then click Run Agent Workflow.")
+    st.info("Enter a stock ticker, then ask an initial research question in the chat box.")
     col1, col2, col3 = st.columns(3)
-    col1.markdown("**1. 自动拆任务**\n\n从用户目标拆成新闻、情绪、风险、报告四步。")
-    col2.markdown("**2. 带证据输出**\n\n每个判断都能回到新闻标题和风险信号。")
-    col3.markdown("**3. 可交付 memo**\n\n最终结果不是分数，而是可用于汇报的决策摘要。")
+    col1.markdown("**1. 自主选工具**\n\nSupervisor 从完整工具列表决定先查新闻还是 SEC。")
+    col2.markdown("**2. 保留研究记忆**\n\n后续追问会复用上轮证据与 memo，而不是从头开始。")
+    col3.markdown("**3. 带证据输出**\n\nCritic 只在发现缺口时触发补充检索。")
 
 
 def main():
@@ -2088,17 +2270,19 @@ def main():
     )
 
     st.title("StockPilot Agent")
-    st.markdown("面向不能时刻盯盘的长线投资者：自动抓取新闻、分析情绪、识别风险、生成持仓观察 memo。")
+    st.markdown("面向不能时刻盯盘的长线投资者：带上下文记忆地检索、分析、复盘和追问。")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "agent_memory" not in st.session_state:
+        st.session_state.agent_memory = None
+    if "last_result" not in st.session_state:
+        st.session_state.last_result = None
 
     with st.sidebar:
         st.header("Analysis Settings")
         ticker = st.text_input("Stock ticker", "").upper().strip()
-        mission = st.text_area(
-            "Analysis goal",
-            "判断这只股票今天是否出现需要复盘的风险信号，并输出适合投资日志记录的观察摘要。",
-            height=110,
-        )
-        st.caption("Examples: holding risk / positive catalysts / earnings signals / regulation and lawsuits")
+        st.caption("在下方对话框输入首次研究目标；后续可继续追问，例如“详细说说那个监管风险”。")
         max_headlines = st.slider("Headlines to analyze", 6, 30, 16)
         use_llm = st.checkbox("Use LLM for goal analysis and memo", value=True)
         api_key = st.text_input(
@@ -2115,9 +2299,28 @@ def main():
             "密钥仅保留在当前浏览器会话中。开启 LLM 时，会用 embedding 对目标和新闻风险做语义匹配；关闭或刷新页面后需重新输入密钥。"
         )
         allow_fallback_data = st.checkbox("Use offline sample data if live fetch fails", value=False)
-        run_button = st.button("Run Agent Workflow")
+        if st.button("New research conversation"):
+            st.session_state.messages = []
+            st.session_state.agent_memory = None
+            st.session_state.last_result = None
+            st.rerun()
 
-    if run_button:
+    memory_ticker = (st.session_state.agent_memory or {}).get("ticker")
+    if memory_ticker and ticker and memory_ticker != ticker:
+        st.session_state.messages = []
+        st.session_state.agent_memory = None
+        st.session_state.last_result = None
+        st.info("已因 ticker 变更创建新的研究会话。")
+
+    if not st.session_state.messages:
+        render_empty_state()
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    mission = st.chat_input("输入研究目标或继续追问…")
+    if mission:
         if not ticker:
             st.warning("Please enter a stock ticker.")
             return
@@ -2125,23 +2328,33 @@ def main():
             st.warning("请输入 OpenAI API key，或关闭 LLM 模式后使用规则基线运行。")
             return
 
-        with st.spinner("StockPilot Agent 正在运行..."):
-            result = run_workflow(
-                ticker,
-                mission,
-                max_headlines,
-                allow_fallback_data,
-                use_llm,
-                llm_model,
-                api_key=api_key.strip(),
-                embedding_model=embedding_model,
-            )
+        st.session_state.messages.append({"role": "user", "content": mission})
+        with st.chat_message("user"):
+            st.markdown(mission)
+        with st.chat_message("assistant"):
+            with st.spinner("StockPilot Agent 正在分析上下文与证据..."):
+                result = run_workflow(
+                    ticker,
+                    mission,
+                    max_headlines,
+                    allow_fallback_data,
+                    use_llm,
+                    llm_model,
+                    api_key=api_key.strip(),
+                    embedding_model=embedding_model,
+                    prior_memory=st.session_state.agent_memory,
+                    messages=st.session_state.messages,
+                )
+            for warning in result.get("warnings", []):
+                st.warning(warning)
+            st.markdown(result["memo"])
+            st.caption(result["source_note"])
+            render_agent_steps(result["steps"])
+            render_dashboard(result)
 
-        st.caption(result["source_note"])
-        render_agent_steps(result["steps"])
-        render_dashboard(result)
-    else:
-        render_empty_state()
+        st.session_state.messages.append({"role": "assistant", "content": result["memo"]})
+        st.session_state.agent_memory = result["memory"]
+        st.session_state.last_result = result
 
 
 if __name__ == "__main__":
