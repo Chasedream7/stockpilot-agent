@@ -1,5 +1,5 @@
 ---
-title: StockPilotX Agent
+title: StockPilot Agent
 emoji: 📈
 colorFrom: blue
 colorTo: green
@@ -10,7 +10,7 @@ pinned: false
 license: mit
 ---
 
-# StockPilotX Agent
+# StockPilot Agent
 
 ## 一、选题动机
 
@@ -18,7 +18,6 @@ license: mit
 
 长线投资者每天面对海量信息（新闻、财报、监管公告、市场快照），需要在极短时间内判断：**哪些信息是噪音？哪些信号可能影响持仓逻辑？是否需要进一步查阅一手来源（如 SEC 披露）？**
 
-传统做法是：打开 FinViz 看新闻 → 打开 SEC EDGAR 查财报 → 手动做情绪判断 → 写复盘 memo。这个过程重复、耗时，且容易因信息过载而遗漏关键风险（例如一篇新闻提到“反垄断调查”，但投资者可能没意识到需要去查 8-K 文件）。
 
 ### 1.2 这件事现在有多痛？
 
