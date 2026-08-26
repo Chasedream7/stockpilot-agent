@@ -1210,7 +1210,17 @@ def top_headlines(scored_news, label, limit=3):
     return rows.head(limit)["headline"].tolist()
 
 
-def build_rule_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note):
+def build_rule_memo(
+    ticker,
+    mission,
+    goal_profile,
+    summary,
+    risk,
+    snapshot,
+    scored_news,
+    source_note,
+    is_follow_up=False,
+):
     stance = choose_stance(summary, risk)
     positives = top_headlines(scored_news, "Positive")
     negatives = top_headlines(scored_news, "Negative")
@@ -1228,6 +1238,17 @@ def build_rule_memo(ticker, mission, goal_profile, summary, risk, snapshot, scor
         f"P/E: {snapshot.get('P/E', 'N/A')}",
     ]
 
+    followup_block = (
+        f"""
+**本轮追问回答**
+- 本轮问题：{mission}
+- 回答基于上一轮已保留的新闻、情绪、风险和 SEC 证据。
+- 本轮新增重点：请结合上面的证据区，直接回答本轮问题；若没有新增证据，明确说明“本轮未新增来源”。
+"""
+        if is_follow_up
+        else ""
+    )
+
     return f"""
 ### StockPilot Agent Memo: {ticker}
 
@@ -1235,6 +1256,7 @@ def build_rule_memo(ticker, mission, goal_profile, summary, risk, snapshot, scor
 
 **识别到的分析重点**：{goal_profile['label']}  
 {goal_profile['description']}
+{followup_block}
 
 **Agent 结论**：{stance}
 
@@ -1290,6 +1312,7 @@ def build_llm_memo(
     trace=None,
     api_key=None,
     conversation_history=None,
+    is_follow_up=False,
 ):
     system_prompt = """
 You are Portfolio Copilot inside StockPilot Agent.
@@ -1298,6 +1321,9 @@ Use only the supplied metrics, headlines, and risk findings.
 Do not invent news, prices, financial facts, or future predictions.
 Do not provide direct buy/sell/hold instructions.
 Frame conclusions as observation and review guidance, not investment advice.
+If this is a follow-up question, answer the latest question first, explicitly state
+what changed from the previous memo, and do not simply repeat the previous memo.
+If no new source was retrieved, say so clearly and tie the answer to retained evidence.
 """.strip()
 
     payload = {
@@ -1325,18 +1351,20 @@ Frame conclusions as observation and review guidance, not investment advice.
         "recent_headlines": compact_headlines(scored_news),
         "sec_filings": sec_filings or {},
         "conversation_history": compact_conversation(conversation_history),
+        "is_follow_up": is_follow_up,
     }
     user_prompt = f"""
 Create the memo in Markdown with these sections:
 1. StockPilot Agent Memo: {ticker}
 2. User Goal
 3. Goal Focus
-4. Observation
-5. Key Readings
-6. Evidence
-7. Risks To Review
-8. Next Steps
-9. Disclaimer
+4. Follow-up Answer (only when is_follow_up=true)
+5. Observation
+6. Key Readings
+7. Evidence
+8. Risks To Review
+9. Next Steps
+10. Disclaimer
 
 Data:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
@@ -1368,6 +1396,7 @@ def build_memo(
     trace=None,
     api_key=None,
     conversation_history=None,
+    is_follow_up=False,
 ):
     if use_llm:
         try:
@@ -1385,13 +1414,24 @@ def build_memo(
                 trace=trace,
                 api_key=api_key,
                 conversation_history=conversation_history,
+                is_follow_up=is_follow_up,
             )
             if memo:
                 return memo.strip(), "LLM memo generator"
         except Exception:
             pass
 
-    memo = build_rule_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note)
+    memo = build_rule_memo(
+        ticker,
+        mission,
+        goal_profile,
+        summary,
+        risk,
+        snapshot,
+        scored_news,
+        source_note,
+        is_follow_up=is_follow_up,
+    )
     if use_llm:
         return memo, "Rule-based memo fallback"
     return memo, "Rule-based decision writer"
@@ -1867,13 +1907,15 @@ def execute_tool(
             try:
                 state["sec_filings"] = fetch_sec_filings(state["ticker"])
                 count = len(state["sec_filings"]["filings"])
+                if state["is_follow_up"]:
+                    state["revision_requested"] = True
                 detail = f"取得 {count} 条近期 SEC 申报元数据，可作为一手来源入口。"
                 tool_label = "SEC EDGAR filing metadata"
                 output = state["sec_filings"]
             except Exception as error:
                 state["sec_filings"] = {"filings": [], "error": str(error)}
                 # No new evidence was obtained, so do not rewrite the same memo in a loop.
-                state["revision_requested"] = False
+                state["revision_requested"] = state["is_follow_up"]
                 detail = "SEC 披露补检索失败，已记录失败原因；继续基于已有证据生成观察结果。"
                 tool_label = "SEC EDGAR (failed)"
                 output = state["sec_filings"]
@@ -1920,6 +1962,7 @@ def execute_tool(
                 trace=trace,
                 api_key=api_key,
                 conversation_history=state["messages"],
+                is_follow_up=state["is_follow_up"],
             )
             state["memo"] = memo
             state["memo_tool"] = tool_label
@@ -1939,10 +1982,16 @@ def execute_tool(
             )
             state["reviewed_memo_version"] = state["memo_version"]
             state["pending_followup_review"] = False
-            state["revision_requested"] = bool(state["critic"].get("should_retrieve")) and not state["sec_attempted"]
-            if was_followup_review and not state["critic"].get("should_retrieve"):
-                # The user asked a new question; answer it with retained evidence even when no retrieval is needed.
-                state["revision_requested"] = True
+            if was_followup_review:
+                # Every follow-up must produce a new answer. If a missing SEC source
+                # is requested, fetch it first; otherwise revise immediately from memory.
+                state["revision_requested"] = not (
+                    state["critic"].get("should_retrieve") and not state["sec_attempted"]
+                )
+            else:
+                state["revision_requested"] = (
+                    bool(state["critic"].get("should_retrieve")) and not state["sec_attempted"]
+                )
             detail = (
                 f"Critic 评估：{state['critic']['status']}，"
                 f"答案分 {state['critic']['answer_score']}，证据分 {state['critic']['evidence_score']}。"
