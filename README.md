@@ -63,9 +63,9 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-可选的 LLM 模式不需要在本机配置 API Key：启动页面后，在侧边栏输入 OpenAI API key 和模型即可。密钥只用于当前浏览器会话的请求，不会写入 trace、文件或环境变量；关闭或刷新页面后需要重新输入。
+可选的 LLM 模式不需要在本机配置 API Key：启动页面后，在侧边栏输入已获批的 Compass DQP/SQP Key 即可。应用使用 OpenAI Python SDK 的兼容模式，但请求会发送到 Compass 的 `https://compass.llm.shopee.io/compass-api/v1`，通过 `chat.completions` 调用 `compass-v2`；密钥只用于当前浏览器会话，不会写入 trace、文件或环境变量。
 
-默认 embedding 模型是 `text-embedding-3-small`，可以在同一侧边栏更换。输入目标和新闻标题会发送给该模型，用于语义分类；因此它有额外的少量 token 成本。
+默认 embedding 模型是 `compass-embedding-v3`（384 维），可以在同一侧边栏更换。输入目标和新闻标题会发送给该模型，用于语义分类。Compass Key 需要完成 DQP/SQP 审批，并具备所选模型的调用权限。
 
 规则基线模式无需 API Key。`STOCKPILOT_CONTACT_EMAIL`（可选）用于标识 SEC EDGAR 请求；也可用 `STOCKPILOT_TRACE_DIR` 改变 trace 的保存目录。
 
