@@ -138,27 +138,22 @@ class SemanticRoutingTest(unittest.TestCase):
         )
 
         def fake_embeddings(texts, *args, **kwargs):
-            vectors = [[1.0, 0.0]] + [[0.0, 1.0] for _ in profiles]
-            vectors[earnings_index + 1] = [1.0, 0.0]
+            if kwargs["mode"] == "query":
+                return [[1.0, 0.0]]
+            vectors = [[0.0, 1.0] for _ in profiles]
+            vectors[earnings_index] = [1.0, 0.0]
             return vectors
 
         app.embed_texts = fake_embeddings
-        profile = app.infer_goal_profile_with_embedding(
-            "利润率和管理层展望出现变化", "test-embedding", api_key="test-key"
-        )
+        profile = app.infer_goal_profile_with_embedding("利润率和管理层展望出现变化")
         self.assertEqual(profile["key"], "earnings_review")
-        self.assertEqual(profile["analysis_source"], "Embedding semantic router")
+        self.assertEqual(profile["analysis_source"], "Local embedding semantic router")
 
     def test_risk_detection_uses_embedding_category_when_available(self):
         def fake_embeddings(texts, *args, **kwargs):
-            # First four vectors are taxonomy categories; the final vector is the headline.
-            return [
-                [1.0, 0.0],
-                [0.0, 1.0],
-                [0.2, 0.2],
-                [0.1, 0.1],
-                [0.0, 1.0],
-            ]
+            if kwargs["mode"] == "passage":
+                return [[1.0, 0.0], [0.0, 1.0], [0.2, 0.2], [0.1, 0.1]]
+            return [[0.0, 1.0]]
 
         app.embed_texts = fake_embeddings
         scored_news = pd.DataFrame(
@@ -175,24 +170,25 @@ class SemanticRoutingTest(unittest.TestCase):
             scored_news,
             snapshot={},
             goal_profile=app.profile_by_key("earnings_review"),
-            api_key="test-key",
-            embedding_model="test-embedding",
+            use_semantic=True,
         )
-        self.assertEqual(risk["classifier"], "embedding semantic classifier")
+        self.assertEqual(risk["classifier"], "local embedding semantic classifier")
         self.assertEqual(risk["findings"][0]["category"], "业绩/指引")
-        self.assertEqual(risk["findings"][0]["classification_source"], "embedding semantic classifier")
+        self.assertEqual(risk["findings"][0]["classification_source"], "local embedding semantic classifier")
 
 
-class CompassSDKContractTest(unittest.TestCase):
+class DeepSeekSDKContractTest(unittest.TestCase):
     def setUp(self):
         self.original_openai = app.OpenAI
-        self.original_client = app.get_compass_client
+        self.original_client = app.get_deepseek_client
+        self.original_embedder = app.get_local_embedding_model
 
     def tearDown(self):
         app.OpenAI = self.original_openai
-        app.get_compass_client = self.original_client
+        app.get_deepseek_client = self.original_client
+        app.get_local_embedding_model = self.original_embedder
 
-    def test_compass_client_uses_compatibility_base_url(self):
+    def test_deepseek_client_uses_compatibility_base_url(self):
         captured = {}
 
         def fake_openai(**kwargs):
@@ -200,10 +196,10 @@ class CompassSDKContractTest(unittest.TestCase):
             return object()
 
         app.OpenAI = fake_openai
-        app.get_compass_client("compass-test-key")
+        app.get_deepseek_client("deepseek-test-key")
 
-        self.assertEqual(captured["api_key"], "compass-test-key")
-        self.assertEqual(captured["base_url"], app.COMPASS_BASE_URL)
+        self.assertEqual(captured["api_key"], "deepseek-test-key")
+        self.assertEqual(captured["base_url"], app.DEEPSEEK_BASE_URL)
 
     def test_llm_call_uses_chat_completions_not_responses(self):
         captured = {}
@@ -219,27 +215,44 @@ class CompassSDKContractTest(unittest.TestCase):
         fake_client = SimpleNamespace(
             chat=SimpleNamespace(completions=FakeCompletions())
         )
-        app.get_compass_client = lambda api_key=None: fake_client
-        output = app.call_llm_text("system prompt", "user prompt", "compass-v2", api_key="key")
+        app.get_deepseek_client = lambda api_key=None: fake_client
+        output = app.call_llm_text("system prompt", "user prompt", "deepseek-v4-flash", api_key="key")
 
         self.assertEqual(output, '{"action": "finish"}')
-        self.assertEqual(captured["model"], "compass-v2")
+        self.assertEqual(captured["model"], "deepseek-v4-flash")
         self.assertEqual(captured["messages"][0]["role"], "system")
         self.assertEqual(captured["messages"][1]["role"], "user")
+        self.assertEqual(captured["extra_body"]["thinking"]["type"], "disabled")
+
+    def test_local_embedding_uses_e5_query_prefix(self):
+        captured = {}
+
+        class FakeEmbedder:
+            def encode(self, texts, **kwargs):
+                captured["texts"] = texts
+                captured.update(kwargs)
+                return SimpleNamespace(tolist=lambda: [[0.1, 0.2]])
+
+        app.get_local_embedding_model = lambda: FakeEmbedder()
+        vectors = app.embed_texts(["embedding input"], mode="query")
+
+        self.assertEqual(vectors, [[0.1, 0.2]])
+        self.assertEqual(captured["texts"], ["query: embedding input"])
+        self.assertTrue(captured["normalize_embeddings"])
 
 
 class SupervisorPlannerTest(unittest.TestCase):
     def setUp(self):
-        self.original_client = app.get_compass_client
+        self.original_client = app.get_deepseek_client
         self.original_json_call = app.call_llm_json
-        app.get_compass_client = lambda api_key=None: object()
+        app.get_deepseek_client = lambda api_key=None: object()
         app.call_llm_json = lambda *args, **kwargs: {
             "action": "fetch_sec_filings",
             "reason": "财报问题应先取一手披露。",
         }
 
     def tearDown(self):
-        app.get_compass_client = self.original_client
+        app.get_deepseek_client = self.original_client
         app.call_llm_json = self.original_json_call
 
     def test_llm_can_choose_sec_as_the_first_tool_from_complete_manifest(self):
