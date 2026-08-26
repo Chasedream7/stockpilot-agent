@@ -4,7 +4,6 @@
 
 本批使用 DeepSeek `deepseek-v4-flash`，共 28 个 case。23 条首次研究在第一批完成；A04 与 M01–M04 在续跑批次完成。续跑结果和可审计进度保存在 `evaluation/results/llm_20260826_resume/`。trace 中没有 API key，原始 trace 不提交到仓库。
 
-由于第一次进程在最终聚合前被中断，当前仓库保留的是“23 条已完成 trace + 5 条续跑汇总”的可恢复结果，而不是伪造一张全量总分表。下一次运行应使用同一模型、同一 prompt 和 `--start-index` 续跑/聚合后，再发布全量均值。
 
 ## 已观察到的信号
 
