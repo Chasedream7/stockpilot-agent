@@ -90,7 +90,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(result["steps"][-1]["action"], "finish")
 
     def test_follow_up_reuses_evidence_and_only_fetches_the_missing_primary_source(self):
-        first, _ = self.run_case("判断这只股票近期是否有值得记录的风险信号")
+        first, _ = self.run_case("判断近期新闻是否改变我的长期持仓逻辑")
         history = [
             {"role": "user", "content": first["mission"]},
             {"role": "assistant", "content": first["memo"]},
@@ -125,6 +125,23 @@ class AgentLoopTest(unittest.TestCase):
         self.assertGreater(follow_up["memo"].count("本轮追问回答"), 0)
         self.assertIn("详细说说那个监管风险", follow_up["memo"])
         self.assertNotEqual(follow_up["memo"], first["memo"])
+        self.assertTrue(follow_up["goal_changed"])
+        self.assertEqual(first["goal_profile"]["key"], "hold_check")
+        self.assertEqual(follow_up["goal_profile"]["key"], "regulation_review")
+
+    def test_short_regulatory_follow_up_beats_generic_risk_profile(self):
+        profile = app.infer_goal_profile("详细说说那个监管风险")
+        self.assertEqual(profile["key"], "regulation_review")
+
+    def test_llm_mode_keeps_explicit_follow_up_topic_even_without_embedding(self):
+        profile, tool = app.analyze_goal(
+            "请核对 SEC 披露中的监管调查",
+            use_llm=True,
+            model="unused",
+            api_key=None,
+        )
+        self.assertEqual(profile["key"], "regulation_review")
+        self.assertEqual(tool, "High-signal intent router")
 
 
 class SemanticRoutingTest(unittest.TestCase):
