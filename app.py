@@ -1,9 +1,12 @@
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import tempfile
 import time
+import uuid
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 import pandas as pd
@@ -25,7 +28,87 @@ except ImportError:
 
 
 FINVIZ_URL = "https://finviz.com/quote.ashx?t="
+SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
+TRACE_SCHEMA_VERSION = "1.0"
+MAX_AGENT_STEPS = 10
+
+
+class TraceLogger:
+    """Append-only JSONL trace for replaying and evaluating one agent run."""
+
+    def __init__(self, trace_dir=None, run_id=None):
+        self.run_id = run_id or f"run_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        base_dir = trace_dir or os.environ.get("STOCKPILOT_TRACE_DIR", "traces")
+        self.trace_dir = Path(base_dir)
+        self.trace_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.trace_dir / f"{self.run_id}.jsonl"
+        self.started_at = time.perf_counter()
+        self.events = []
+
+    @staticmethod
+    def _json_safe(value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (dt.datetime, dt.date, pd.Timestamp)):
+            return value.isoformat()
+        if isinstance(value, pd.DataFrame):
+            return {
+                "type": "dataframe",
+                "rows": len(value),
+                "columns": list(value.columns),
+                "preview": TraceLogger._json_safe(value.head(5).reset_index().to_dict("records")),
+            }
+        if isinstance(value, dict):
+            return {str(key): TraceLogger._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [TraceLogger._json_safe(item) for item in list(value)[:30]]
+        return str(value)
+
+    def record(
+        self,
+        event,
+        *,
+        step,
+        agent,
+        input_data=None,
+        decision=None,
+        tool_call=None,
+        output=None,
+        usage=None,
+        duration_ms=None,
+        error=None,
+    ):
+        entry = {
+            "schema_version": TRACE_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "elapsed_ms": round((time.perf_counter() - self.started_at) * 1000, 2),
+            "event": event,
+            "step": step,
+            "agent": agent,
+            "input": self._json_safe(input_data),
+            "decision": self._json_safe(decision),
+            "tool_call": self._json_safe(tool_call),
+            "output": self._json_safe(output),
+            "usage": self._json_safe(usage or {}),
+            "duration_ms": round(duration_ms, 2) if duration_ms is not None else None,
+            "error": str(error) if error else None,
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        self.events.append(entry)
+        return entry
+
+
+def short_text(value, limit=700):
+    """Keep trace prompts inspectable without turning each trace into a huge artifact."""
+    if value is None:
+        return None
+    value = str(value)
+    return value if len(value) <= limit else f"{value[:limit]}… [truncated]"
 
 RISK_KEYWORDS = {
     "监管/法律": [
@@ -299,6 +382,71 @@ def fetch_finviz_soup(ticker):
     return BeautifulSoup(html, "html.parser")
 
 
+def sec_headers():
+    """SEC asks automated clients to identify a contact address."""
+    contact = get_config_value("STOCKPILOT_CONTACT_EMAIL", "research@example.com")
+    return {
+        "User-Agent": f"StockPilotX research prototype/0.1 {contact}",
+    }
+
+
+def fetch_json(url, headers, timeout=12):
+    request = Request(url=url, headers=headers)
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def fetch_sec_filings(ticker, max_filings=8):
+    """Return recent primary SEC filings for a US-listed ticker, with source URLs."""
+    ticker = ticker.upper().strip()
+    ticker_index = fetch_json(SEC_COMPANY_TICKERS_URL, sec_headers())
+    company = next(
+        (item for item in ticker_index.values() if item.get("ticker", "").upper() == ticker),
+        None,
+    )
+    if not company:
+        raise ValueError(f"SEC could not find a company mapping for ticker {ticker}.")
+
+    cik = int(company["cik_str"])
+    submissions = fetch_json(SEC_SUBMISSIONS_URL.format(cik=cik), sec_headers())
+    recent = submissions.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    filings = []
+    supported_forms = {"10-K", "10-Q", "8-K", "20-F", "6-K"}
+    for index, form in enumerate(forms):
+        if form not in supported_forms:
+            continue
+        accession = recent.get("accessionNumber", [""])[index].replace("-", "")
+        document = recent.get("primaryDocument", [""])[index]
+        if not accession or not document:
+            continue
+        filings.append(
+            {
+                "form": form,
+                "filed_at": recent.get("filingDate", [""])[index],
+                "report_date": recent.get("reportDate", [""])[index],
+                "items": recent.get("items", [""])[index],
+                "document_url": SEC_ARCHIVES_URL.format(
+                    cik=cik,
+                    accession=accession,
+                    document=document,
+                ),
+            }
+        )
+        if len(filings) >= max_filings:
+            break
+
+    if not filings:
+        raise ValueError(f"SEC returned no recent supported filings for {ticker}.")
+
+    return {
+        "company_name": company.get("title", ticker),
+        "cik": cik,
+        "filings": filings,
+        "source_note": "SEC EDGAR filings (primary source metadata)",
+    }
+
+
 def parse_snapshot(soup):
     tables = soup.find_all("table", class_="snapshot-table2")
     if not tables:
@@ -499,22 +647,86 @@ def extract_json_object(text):
         return None
 
 
-def call_llm_text(system_prompt, user_prompt, model):
+def extract_usage(response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    return {
+        "input_tokens": getattr(usage, "input_tokens", None),
+        "output_tokens": getattr(usage, "output_tokens", None),
+        "total_tokens": getattr(usage, "total_tokens", None),
+    }
+
+
+def call_llm_text(system_prompt, user_prompt, model, trace=None, agent="LLM", step="llm_call"):
     client = get_openai_client()
     if client is None:
         return None
 
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+    started_at = time.perf_counter()
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        output = response.output_text
+    except Exception as error:
+        if trace:
+            trace.record(
+                "llm_call_failed",
+                step=step,
+                agent=agent,
+                input_data={
+                    "system_prompt": short_text(system_prompt),
+                    "user_prompt": short_text(user_prompt),
+                    "model": model,
+                },
+                error=error,
+                duration_ms=(time.perf_counter() - started_at) * 1000,
+            )
+        raise
+
+    if trace:
+        trace.record(
+            "llm_call",
+            step=step,
+            agent=agent,
+            input_data={
+                "system_prompt": short_text(system_prompt),
+                "user_prompt": short_text(user_prompt),
+                "model": model,
+            },
+            output={"text": output},
+            usage=extract_usage(response),
+            duration_ms=(time.perf_counter() - started_at) * 1000,
+        )
+    return output
+
+
+def call_llm_json(system_prompt, user_prompt, model, trace=None, agent="LLM", step="llm_json"):
+    output = call_llm_text(
+        system_prompt,
+        user_prompt,
+        model,
+        trace=trace,
+        agent=agent,
+        step=step,
     )
-    return response.output_text
+    parsed = extract_json_object(output)
+    if trace:
+        trace.record(
+            "structured_output_parsed" if parsed else "structured_output_invalid",
+            step=step,
+            agent=agent,
+            output=parsed or {"raw_text": short_text(output)},
+        )
+    return parsed
 
 
-def infer_goal_profile_with_llm(mission, model):
+def infer_goal_profile_with_llm(mission, model, trace=None):
     system_prompt = """
 You are the goal analysis agent for StockPilot Agent.
 Map the user's natural-language investing research goal to exactly one supported goal profile.
@@ -534,8 +746,14 @@ Rules:
 - Return JSON only.
 """.strip()
 
-    output = call_llm_text(system_prompt, user_prompt, model)
-    parsed = extract_json_object(output)
+    parsed = call_llm_json(
+        system_prompt,
+        user_prompt,
+        model,
+        trace=trace,
+        agent="PM Agent",
+        step="goal_analysis",
+    )
     if not parsed:
         return None
 
@@ -549,10 +767,10 @@ Rules:
     return enriched
 
 
-def analyze_goal(mission, use_llm, model):
+def analyze_goal(mission, use_llm, model, trace=None):
     if use_llm:
         try:
-            profile = infer_goal_profile_with_llm(mission, model)
+            profile = infer_goal_profile_with_llm(mission, model, trace=trace)
             if profile:
                 return profile, "LLM goal analysis"
         except Exception as error:
@@ -726,7 +944,19 @@ def compact_headlines(scored_news, limit=10):
     ]
 
 
-def build_llm_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note, model):
+def build_llm_memo(
+    ticker,
+    mission,
+    goal_profile,
+    summary,
+    risk,
+    snapshot,
+    scored_news,
+    source_note,
+    model,
+    sec_filings=None,
+    trace=None,
+):
     system_prompt = """
 You are Portfolio Copilot inside StockPilot Agent.
 Write a concise Chinese holding-observation memo for a long-term individual investor.
@@ -759,6 +989,7 @@ Frame conclusions as observation and review guidance, not investment advice.
         "market_snapshot": snapshot,
         "risk_findings": risk["findings"],
         "recent_headlines": compact_headlines(scored_news),
+        "sec_filings": sec_filings or {},
     }
     user_prompt = f"""
 Create the memo in Markdown with these sections:
@@ -776,10 +1007,30 @@ Data:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 """.strip()
 
-    return call_llm_text(system_prompt, user_prompt, model)
+    return call_llm_text(
+        system_prompt,
+        user_prompt,
+        model,
+        trace=trace,
+        agent="Portfolio Copilot",
+        step="memo_generation",
+    )
 
 
-def build_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_news, source_note, use_llm, model):
+def build_memo(
+    ticker,
+    mission,
+    goal_profile,
+    summary,
+    risk,
+    snapshot,
+    scored_news,
+    source_note,
+    use_llm,
+    model,
+    sec_filings=None,
+    trace=None,
+):
     if use_llm:
         try:
             memo = build_llm_memo(
@@ -792,6 +1043,8 @@ def build_memo(ticker, mission, goal_profile, summary, risk, snapshot, scored_ne
                 scored_news,
                 source_note,
                 model,
+                sec_filings=sec_filings,
+                trace=trace,
             )
             if memo:
                 return memo.strip(), "LLM memo generator"
@@ -848,104 +1101,563 @@ def plot_sentiment_mix(scored_news):
     return fig
 
 
-def run_workflow(ticker, mission, max_headlines, allow_fallback_data, use_llm=False, llm_model=DEFAULT_LLM_MODEL):
-    goal_profile, goal_tool = analyze_goal(mission, use_llm, llm_model)
+AGENT_TOOLS = {
+    "collect_news": {
+        "agent": "News Scout Agent",
+        "label": "FinViz news + market snapshot",
+        "when": "需要近期市场叙事、标题证据或价格快照时。",
+    },
+    "fetch_sec_filings": {
+        "agent": "Evidence Agent",
+        "label": "SEC EDGAR filing metadata",
+        "when": "财报、监管或管理层披露类问题需要一手来源，或 Critic 要求补证据时。",
+    },
+    "analyze_sentiment": {
+        "agent": "Quant Agent",
+        "label": "Sentiment scorer",
+        "when": "已经获得新闻，且需要量化近期叙事倾向时。",
+    },
+    "assess_risk": {
+        "agent": "Risk Agent",
+        "label": "Risk signal scanner",
+        "when": "已经获得带情绪的新闻，需要按用户目标归纳风险时。",
+    },
+    "draft_memo": {
+        "agent": "Portfolio Copilot",
+        "label": "Evidence-grounded memo writer",
+        "when": "已有足够的新闻、情绪和风险摘要，需要回答用户问题时。",
+    },
+    "self_check": {
+        "agent": "Critic Agent",
+        "label": "Answer completeness check",
+        "when": "memo 初稿完成后，检查是否回答问题、是否有证据和是否应补检索。",
+    },
+}
+
+
+def mission_needs_primary_source(mission):
+    keywords = [
+        "财报",
+        "业绩",
+        "营收",
+        "利润",
+        "指引",
+        "监管",
+        "诉讼",
+        "反垄断",
+        "调查",
+        "公告",
+        "earnings",
+        "revenue",
+        "guidance",
+        "regulation",
+        "lawsuit",
+        "antitrust",
+        "probe",
+        "investigation",
+        "filing",
+    ]
+    mission = mission.lower()
+    return any(keyword in mission for keyword in keywords)
+
+
+def planner_state(state):
+    summary = state.get("summary") or {}
+    risk = state.get("risk") or {}
+    critic = state.get("critic") or {}
+    return {
+        "ticker": state["ticker"],
+        "mission": state["mission"],
+        "goal_focus": state["goal_profile"]["label"],
+        "news_collected": state["news_df"] is not None,
+        "headline_count": summary.get("total", 0),
+        "sentiment_ready": state["scored_news"] is not None,
+        "risk_ready": state["risk"] is not None,
+        "risk_level": risk.get("level"),
+        "sec_filing_attempted": state["sec_attempted"],
+        "sec_filing_count": len((state.get("sec_filings") or {}).get("filings", [])),
+        "memo_version": state["memo_version"],
+        "memo_reviewed": state["reviewed_memo_version"] == state["memo_version"],
+        "critic_status": critic.get("status"),
+        "critic_requests_primary_source": critic.get("should_retrieve", False),
+        "steps_remaining": MAX_AGENT_STEPS - state["tool_steps"],
+    }
+
+
+def valid_actions(state):
+    actions = []
+    if state["news_df"] is None:
+        actions.append("collect_news")
+    if not state["sec_attempted"]:
+        actions.append("fetch_sec_filings")
+    if state["news_df"] is not None and state["scored_news"] is None:
+        actions.append("analyze_sentiment")
+    if state["scored_news"] is not None and state["risk"] is None:
+        actions.append("assess_risk")
+    critic_requires_unfetched_source = (
+        (state.get("critic") or {}).get("should_retrieve") and not state["sec_attempted"]
+    )
+    if state["risk"] is not None and (
+        state["memo"] is None or state["revision_requested"]
+    ) and not critic_requires_unfetched_source:
+        actions.append("draft_memo")
+    if state["memo"] is not None and state["reviewed_memo_version"] != state["memo_version"]:
+        actions.append("self_check")
+
+    critic = state.get("critic") or {}
+    reviewed_current_memo = state["reviewed_memo_version"] == state["memo_version"]
+    if state["memo"] is not None and reviewed_current_memo and not (
+        critic.get("should_retrieve") and not state["sec_attempted"]
+    ):
+        actions.append("finish")
+    return actions
+
+
+def rule_next_action(state):
+    """Safe deterministic fallback when an LLM is unavailable or emits an invalid action."""
+    if state["news_df"] is None:
+        return "collect_news", "缺少新闻证据，先建立可分析的事实基础。"
+    if (state.get("critic") or {}).get("should_retrieve") and not state["sec_attempted"]:
+        return "fetch_sec_filings", "Critic 要求补一手披露证据。"
+    if state["scored_news"] is None:
+        return "analyze_sentiment", "新闻已取得，需先量化叙事方向。"
+    if state["risk"] is None:
+        return "assess_risk", "情绪已量化，需映射到用户关注的风险维度。"
+    if state["memo"] is None or state["revision_requested"]:
+        return "draft_memo", "证据已就绪，需要生成或修订面向用户的问题回答。"
+    if state["reviewed_memo_version"] != state["memo_version"]:
+        return "self_check", "初稿还没有经过完整性和证据检查。"
+    return "finish", "当前 memo 已完成检查，且没有可执行的补证据请求。"
+
+
+def decide_next_action(state, use_llm, model, trace):
+    fallback_action, fallback_reason = rule_next_action(state)
+    available = valid_actions(state)
+    if fallback_action not in available:
+        fallback_action = available[0]
+    if not use_llm or get_openai_client() is None:
+        decision = {
+            "action": fallback_action,
+            "reason": fallback_reason,
+            "decision_source": "rule fallback",
+        }
+        trace.record(
+            "planner_decision",
+            step=state["tool_steps"] + 1,
+            agent="Supervisor Agent",
+            input_data={"state": planner_state(state), "available_actions": available},
+            decision=decision,
+        )
+        return decision
+
+    tool_text = "\n".join(
+        f"- {name}: {AGENT_TOOLS[name]['when']}" for name in available if name in AGENT_TOOLS
+    )
+    if "finish" in available:
+        tool_text += "\n- finish: 仅当当前 memo 已被 Critic 审查且不需要补一手证据时。"
+    system_prompt = """
+You are the Supervisor Agent for an evidence-grounded stock research workflow.
+Choose exactly one next action from the available actions. Your job is to adapt the
+path to the user's goal and the evidence state, not to follow a fixed checklist.
+Never provide investment advice. A short reason is a decision justification, not
+private chain-of-thought. Return JSON only: {"action": "...", "reason": "..."}.
+""".strip()
+    user_prompt = f"""
+Current workflow state:
+{json.dumps(planner_state(state), ensure_ascii=False, indent=2)}
+
+Available actions:
+{tool_text}
+
+Rules:
+- Use `collect_news` before sentiment/risk/memo whenever no news is available.
+- Use `fetch_sec_filings` for earnings, regulation, filings, or when the Critic asks for a primary source; do not over-retrieve for a generic mood check.
+- Do not choose `draft_memo` until risk analysis is ready.
+- Do not choose `finish` until Critic has checked the current memo.
+""".strip()
+    parsed = call_llm_json(
+        system_prompt,
+        user_prompt,
+        model,
+        trace=trace,
+        agent="Supervisor Agent",
+        step=f"planner_{state['tool_steps'] + 1}",
+    )
+    action = (parsed or {}).get("action")
+    reason = (parsed or {}).get("reason")
+    if action not in available:
+        trace.record(
+            "planner_decision_rejected",
+            step=state["tool_steps"] + 1,
+            agent="Supervisor Agent",
+            input_data={"available_actions": available},
+            decision={"proposed_action": action, "reason": reason},
+            error="LLM proposed an unavailable action; safe fallback applied.",
+        )
+        action, reason = fallback_action, fallback_reason
+        source = "LLM invalid-output fallback"
+    else:
+        source = "LLM planner"
+    decision = {"action": action, "reason": short_text(reason, 240), "decision_source": source}
+    trace.record(
+        "planner_decision",
+        step=state["tool_steps"] + 1,
+        agent="Supervisor Agent",
+        input_data={"state": planner_state(state), "available_actions": available},
+        decision=decision,
+    )
+    return decision
+
+
+def fallback_critic_check(state):
+    has_primary_source = bool((state.get("sec_filings") or {}).get("filings"))
+    needs_primary = mission_needs_primary_source(state["mission"]) and not has_primary_source
+    has_live_evidence = state["source_note"].startswith("Live")
+    evidence_score = 75 if has_live_evidence else 45
+    if has_primary_source:
+        evidence_score = min(95, evidence_score + 15)
+    return {
+        "status": "needs_more_evidence" if needs_primary else "pass",
+        "answer_score": 72 if state["memo"] else 0,
+        "evidence_score": evidence_score,
+        "should_retrieve": needs_primary,
+        "recommended_action": "fetch_sec_filings" if needs_primary else "finish",
+        "missing_evidence": ["近期 SEC 披露或公告"] if needs_primary else [],
+        "contradictions": [],
+        "reason": (
+            "用户问题涉及业绩/监管，但尚未成功取得一手披露来源。"
+            if needs_primary
+            else "规则检查未发现可自动判断的缺口；仍建议人工核对重要结论。"
+        ),
+        "predicted_user_followup": "ask_for_evidence" if needs_primary else "accept",
+        "judge_source": "rule fallback",
+    }
+
+
+def self_check_memo(state, use_llm, model, trace):
+    if not use_llm or get_openai_client() is None:
+        return fallback_critic_check(state)
+
+    system_prompt = """
+You are the Critic Agent for a financial research assistant. Evaluate only whether
+the memo answers the user's research question with the supplied evidence. Do not
+give investment advice and do not invent facts. Return JSON only with: status
+(pass|needs_more_evidence), answer_score (0-100), evidence_score (0-100),
+should_retrieve (boolean), recommended_action (fetch_sec_filings|finish),
+missing_evidence (array), contradictions (array), reason (concise Chinese).
+predicted_user_followup (accept|ask_for_evidence|retry).
+Request SEC filings only when the question or draft makes a material earnings,
+regulatory, filing, or management-disclosure claim that headlines alone cannot support.
+""".strip()
+    evidence = {
+        "mission": state["mission"],
+        "source_note": state["source_note"],
+        "headline_count": state["summary"]["total"],
+        "risk": state["risk"],
+        "sec_filings": state.get("sec_filings") or {},
+        "memo": state["memo"],
+    }
+    parsed = call_llm_json(
+        system_prompt,
+        json.dumps(evidence, ensure_ascii=False, indent=2),
+        model,
+        trace=trace,
+        agent="Critic Agent",
+        step=f"self_check_{state['memo_version']}",
+    )
+    if not parsed or parsed.get("status") not in {"pass", "needs_more_evidence"}:
+        fallback = fallback_critic_check(state)
+        fallback["judge_source"] = "LLM invalid-output fallback"
+        return fallback
+
+    should_retrieve = bool(parsed.get("should_retrieve"))
+    recommended = parsed.get("recommended_action")
+    if recommended not in {"fetch_sec_filings", "finish"}:
+        recommended = "fetch_sec_filings" if should_retrieve else "finish"
+    followup = parsed.get("predicted_user_followup")
+    if followup not in {"accept", "ask_for_evidence", "retry"}:
+        followup = "ask_for_evidence" if should_retrieve else "accept"
+    has_primary_source = bool((state.get("sec_filings") or {}).get("filings"))
+    if mission_needs_primary_source(state["mission"]) and not has_primary_source:
+        should_retrieve = True
+        recommended = "fetch_sec_filings"
+        followup = "ask_for_evidence"
+        parsed["status"] = "needs_more_evidence"
+        parsed["reason"] = (
+            f"{parsed.get('reason', '')} 证据护栏：该问题需要成功取得一手披露来源。"
+        ).strip()
+    return {
+        "status": parsed["status"],
+        "answer_score": max(0, min(100, int(parsed.get("answer_score", 0)))),
+        "evidence_score": max(0, min(100, int(parsed.get("evidence_score", 0)))),
+        "should_retrieve": should_retrieve,
+        "recommended_action": recommended,
+        "missing_evidence": parsed.get("missing_evidence", [])[:5],
+        "contradictions": parsed.get("contradictions", [])[:5],
+        "reason": short_text(parsed.get("reason", ""), 500),
+        "predicted_user_followup": followup,
+        "judge_source": "LLM-as-judge",
+    }
+
+
+def execute_tool(action, state, use_llm, model, trace):
+    step_number = state["tool_steps"] + 1
+    agent = AGENT_TOOLS[action]["agent"]
+    started_at = time.perf_counter()
+    trace.record(
+        "tool_started",
+        step=step_number,
+        agent=agent,
+        input_data=planner_state(state),
+        tool_call={"name": action},
+    )
+    try:
+        if action == "collect_news":
+            try:
+                soup = fetch_finviz_soup(state["ticker"])
+                state["snapshot"] = parse_snapshot(soup)
+                state["news_df"] = parse_news(soup.find(id="news-table"), state["max_headlines"])
+                state["source_note"] = "Live FinViz data"
+                detail = f"抓取到 {len(state['news_df'])} 条最近新闻，并提取页面市场快照。"
+                tool_label = "FinViz scraper"
+            except Exception as error:
+                if not state["allow_fallback_data"]:
+                    raise
+                state["source_note"] = f"Offline sample data; live fetch failed: {error}"
+                state["news_df"] = create_fallback_news(state["ticker"], state["max_headlines"])
+                detail = "实时网页抓取失败，已切换到离线样例数据；请不要把该结果作为当天行情判断。"
+                tool_label = "Offline sample dataset"
+            output = {"headlines": state["news_df"], "snapshot": state["snapshot"], "source_note": state["source_note"]}
+
+        elif action == "fetch_sec_filings":
+            state["sec_attempted"] = True
+            try:
+                state["sec_filings"] = fetch_sec_filings(state["ticker"])
+                count = len(state["sec_filings"]["filings"])
+                detail = f"取得 {count} 条近期 SEC 申报元数据，可作为一手来源入口。"
+                tool_label = "SEC EDGAR filing metadata"
+                output = state["sec_filings"]
+            except Exception as error:
+                state["sec_filings"] = {"filings": [], "error": str(error)}
+                # No new evidence was obtained, so do not rewrite the same memo in a loop.
+                state["revision_requested"] = False
+                detail = "SEC 披露补检索失败，已记录失败原因；继续基于已有证据生成观察结果。"
+                tool_label = "SEC EDGAR (failed)"
+                output = state["sec_filings"]
+
+        elif action == "analyze_sentiment":
+            state["scored_news"] = score_news(state["news_df"])
+            state["summary"] = summarize_sentiment(state["scored_news"])
+            detail = (
+                f"完成 {state['summary']['total']} 条标题打分：Positive {state['summary']['positive']}，"
+                f"Neutral {state['summary']['neutral']}，Negative {state['summary']['negative']}。"
+            )
+            tool_label = state["scored_news"].attrs.get("sentiment_tool", "Sentiment analyzer")
+            output = state["summary"]
+
+        elif action == "assess_risk":
+            state["risk"] = detect_risks(
+                state["scored_news"], state["snapshot"], state["goal_profile"]
+            )
+            detail = (
+                f"识别到 {len(state['risk']['findings'])} 个风险信号，其中 "
+                f"{state['risk']['focus_matches']} 个与当前分析重点直接相关；综合风险等级为 {state['risk']['level']}。"
+            )
+            tool_label = "Keyword risk scanner"
+            output = state["risk"]
+
+        elif action == "draft_memo":
+            memo, tool_label = build_memo(
+                state["ticker"],
+                state["mission"],
+                state["goal_profile"],
+                state["summary"],
+                state["risk"],
+                state["snapshot"],
+                state["scored_news"],
+                state["source_note"],
+                use_llm,
+                model,
+                sec_filings=state.get("sec_filings"),
+                trace=trace,
+            )
+            state["memo"] = memo
+            state["memo_tool"] = tool_label
+            state["memo_version"] += 1
+            state["revision_requested"] = False
+            detail = f"已生成第 {state['memo_version']} 版结构化 memo，等待 Critic 检查。"
+            output = {"memo_version": state["memo_version"], "memo": memo, "generator": tool_label}
+
+        elif action == "self_check":
+            state["critic"] = self_check_memo(state, use_llm, model, trace)
+            state["reviewed_memo_version"] = state["memo_version"]
+            state["revision_requested"] = bool(state["critic"].get("should_retrieve")) and not state["sec_attempted"]
+            detail = (
+                f"Critic 评估：{state['critic']['status']}，"
+                f"答案分 {state['critic']['answer_score']}，证据分 {state['critic']['evidence_score']}。"
+            )
+            tool_label = state["critic"]["judge_source"]
+            output = state["critic"]
+
+        else:
+            raise ValueError(f"Unknown agent tool: {action}")
+
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        trace.record(
+            "tool_completed",
+            step=step_number,
+            agent=agent,
+            tool_call={"name": action, "label": tool_label},
+            output=output,
+            duration_ms=duration_ms,
+        )
+        state["tool_steps"] += 1
+        return {"agent": agent, "tool": tool_label, "output": detail, "action": action}
+    except Exception as error:
+        trace.record(
+            "tool_failed",
+            step=step_number,
+            agent=agent,
+            tool_call={"name": action},
+            error=error,
+            duration_ms=(time.perf_counter() - started_at) * 1000,
+        )
+        raise
+
+
+def run_workflow(
+    ticker,
+    mission,
+    max_headlines,
+    allow_fallback_data,
+    use_llm=False,
+    llm_model=DEFAULT_LLM_MODEL,
+    trace_dir=None,
+):
+    """Run an inspectable supervisor loop instead of a fixed, always-five-step pipeline."""
+    trace = TraceLogger(trace_dir=trace_dir)
+    trace.record(
+        "run_started",
+        step=0,
+        agent="Supervisor Agent",
+        input_data={
+            "ticker": ticker,
+            "mission": mission,
+            "max_headlines": max_headlines,
+            "allow_fallback_data": allow_fallback_data,
+            "llm_enabled": use_llm,
+            "llm_model": llm_model,
+        },
+    )
+    goal_started_at = time.perf_counter()
+    goal_profile, goal_tool = analyze_goal(mission, use_llm, llm_model, trace=trace)
+    trace.record(
+        "tool_completed",
+        step=0,
+        agent="PM Agent",
+        tool_call={"name": "analyze_goal", "label": goal_tool},
+        output=goal_profile,
+        duration_ms=(time.perf_counter() - goal_started_at) * 1000,
+    )
     steps = [
         {
-            "agent": "Briefing Agent",
+            "agent": "PM Agent",
             "tool": goal_tool,
             "output": (
                 f"识别到分析重点：{goal_profile['label']}。"
                 f"优先关注：{format_categories(goal_profile['priority_categories'])}。"
                 f"{'原因：' + goal_profile.get('llm_reason', '') if goal_profile.get('llm_reason') else ''}"
             ),
+            "action": "analyze_goal",
         }
     ]
+    state = {
+        "ticker": ticker,
+        "mission": mission,
+        "max_headlines": max_headlines,
+        "allow_fallback_data": allow_fallback_data,
+        "goal_profile": goal_profile,
+        "source_note": "Evidence has not been collected yet.",
+        "snapshot": {},
+        "news_df": None,
+        "scored_news": None,
+        "summary": None,
+        "risk": None,
+        "sec_filings": None,
+        "sec_attempted": False,
+        "memo": None,
+        "memo_tool": None,
+        "memo_version": 0,
+        "reviewed_memo_version": 0,
+        "revision_requested": False,
+        "critic": None,
+        "tool_steps": 0,
+    }
 
-    source_note = "Live FinViz data"
-    snapshot = {}
-    try:
-        soup = fetch_finviz_soup(ticker)
-        snapshot = parse_snapshot(soup)
-        news_df = parse_news(soup.find(id="news-table"), max_headlines)
+    terminal_reason = ""
+    while state["tool_steps"] < MAX_AGENT_STEPS:
+        decision = decide_next_action(state, use_llm, llm_model, trace)
+        if decision["action"] == "finish":
+            terminal_reason = decision["reason"]
+            steps.append(
+                {
+                    "agent": "Supervisor Agent",
+                    "tool": "Finish",
+                    "output": f"结束本次分析：{terminal_reason}",
+                    "action": "finish",
+                }
+            )
+            break
+        steps.append(execute_tool(decision["action"], state, use_llm, llm_model, trace))
+    else:
+        terminal_reason = f"达到 {MAX_AGENT_STEPS} 步上限，为防止循环而停止。"
         steps.append(
             {
-                "agent": "News Scout Agent",
-                "tool": "FinViz scraper",
-                "output": f"抓取到 {len(news_df)} 条最近新闻，并提取页面市场快照。",
-            }
-        )
-    except Exception as error:
-        if not allow_fallback_data:
-            raise
-        source_note = f"Offline sample data; live fetch failed: {error}"
-        news_df = create_fallback_news(ticker, max_headlines)
-        steps.append(
-            {
-                "agent": "News Scout Agent",
-                "tool": "Offline sample dataset",
-                "output": "实时网页抓取失败，已切换到离线样例数据；请不要把该结果作为当天行情判断。",
+                "agent": "Supervisor Agent",
+                "tool": "Safety stop",
+                "output": terminal_reason,
+                "action": "safety_stop",
             }
         )
 
-    scored_news = score_news(news_df)
-    summary = summarize_sentiment(scored_news)
-    steps.append(
-        {
-            "agent": "Sentiment Agent",
-            "tool": scored_news.attrs.get("sentiment_tool", "Sentiment analyzer"),
-            "output": (
-                f"完成 {summary['total']} 条标题打分：Positive {summary['positive']}，"
-                f"Neutral {summary['neutral']}，Negative {summary['negative']}。"
-            ),
-        }
-    )
+    if state["memo"] is None:
+        trace.record(
+            "run_failed",
+            step=state["tool_steps"],
+            agent="Supervisor Agent",
+            error="Agent stopped before a memo was generated.",
+        )
+        raise RuntimeError("Agent stopped before a memo was generated.")
 
-    risk = detect_risks(scored_news, snapshot, goal_profile)
-    steps.append(
-        {
-            "agent": "Risk Agent",
-            "tool": "Keyword risk scanner",
-            "output": (
-                f"识别到 {len(risk['findings'])} 个风险信号，其中 "
-                f"{risk['focus_matches']} 个与当前分析重点直接相关；综合风险等级为 {risk['level']}。"
-            ),
-        }
+    trace.record(
+        "run_finished",
+        step=state["tool_steps"],
+        agent="Supervisor Agent",
+        output={
+            "terminal_reason": terminal_reason,
+            "memo_version": state["memo_version"],
+            "critic": state["critic"],
+            "source_note": state["source_note"],
+        },
     )
-
-    memo, memo_tool = build_memo(
-        ticker,
-        mission,
-        goal_profile,
-        summary,
-        risk,
-        snapshot,
-        scored_news,
-        source_note,
-        use_llm,
-        llm_model,
-    )
-    steps.append(
-        {
-            "agent": "Portfolio Copilot",
-            "tool": memo_tool,
-            "output": "已生成可用于投资复盘、关注列表更新或个人记录的结构化 memo。",
-        }
-    )
-
     return {
         "ticker": ticker,
         "mission": mission,
         "goal_profile": goal_profile,
-        "source_note": source_note,
-        "snapshot": snapshot,
-        "scored_news": scored_news,
-        "summary": summary,
-        "risk": risk,
-        "memo": memo,
-        "memo_tool": memo_tool,
+        "source_note": state["source_note"],
+        "snapshot": state["snapshot"],
+        "scored_news": state["scored_news"],
+        "summary": state["summary"],
+        "risk": state["risk"],
+        "sec_filings": state["sec_filings"],
+        "critic": state["critic"],
+        "memo": state["memo"],
+        "memo_tool": state["memo_tool"],
         "goal_tool": goal_tool,
         "steps": steps,
+        "trace_path": str(trace.path),
+        "trace_run_id": trace.run_id,
+        "terminal_reason": terminal_reason,
     }
 
 
@@ -1019,6 +1731,24 @@ def render_dashboard(result):
         else:
             st.info("市场快照暂不可用；当前结果主要基于新闻标题。")
 
+        st.markdown("### Critic Check")
+        critic = result.get("critic") or {}
+        if critic:
+            st.caption(
+                f"{critic.get('status', 'unknown')} | 答案分 {critic.get('answer_score', 'N/A')} | "
+                f"证据分 {critic.get('evidence_score', 'N/A')} | "
+                f"预期用户下一句：{critic.get('predicted_user_followup', 'N/A')} | "
+                f"{critic.get('judge_source', '')}"
+            )
+            st.write(critic.get("reason", ""))
+            if critic.get("missing_evidence"):
+                st.warning("待补证据：" + "；".join(critic["missing_evidence"]))
+
+        sec_filings = (result.get("sec_filings") or {}).get("filings", [])
+        if sec_filings:
+            st.markdown("### Primary-source Links")
+            st.dataframe(pd.DataFrame(sec_filings))
+
     st.markdown("### Evidence Table")
     table = scored_news.reset_index()
     table["datetime"] = table["datetime"].dt.strftime("%Y-%m-%d %H:%M")
@@ -1035,6 +1765,19 @@ def render_dashboard(result):
             ]
         ]
     )
+
+    trace_path = Path(result["trace_path"])
+    if trace_path.exists():
+        st.markdown("### Evaluation Trace")
+        st.caption(
+            f"Run: {result['trace_run_id']} · JSONL 中包含每一步的输入、决策、工具调用、输出、耗时和 token 用量。"
+        )
+        st.download_button(
+            "Download JSONL trace",
+            data=trace_path.read_bytes(),
+            file_name=trace_path.name,
+            mime="application/x-ndjson",
+        )
 
 
 def render_empty_state():
