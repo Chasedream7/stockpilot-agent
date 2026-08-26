@@ -149,6 +149,29 @@ class SemanticRoutingTest(unittest.TestCase):
         self.assertEqual(profile["key"], "earnings_review")
         self.assertEqual(profile["analysis_source"], "Local embedding semantic router")
 
+    def test_explicit_regulatory_terms_can_change_a_near_tied_embedding_goal(self):
+        profiles = [app.DEFAULT_GOAL_PROFILE] + app.GOAL_PROFILES
+        hold_index = next(
+            index for index, profile in enumerate(profiles) if profile["key"] == "hold_check"
+        )
+        regulation_index = next(
+            index for index, profile in enumerate(profiles) if profile["key"] == "regulation_review"
+        )
+
+        def fake_embeddings(texts, *args, **kwargs):
+            if kwargs["mode"] == "query":
+                return [[1.0, 0.0]]
+            vectors = [[0.0, 1.0] for _ in profiles]
+            vectors[hold_index] = [1.0, 0.0]
+            vectors[regulation_index] = [0.999, 0.045]
+            return vectors
+
+        app.embed_texts = fake_embeddings
+        profile = app.infer_goal_profile_with_embedding(
+            "长期持仓逻辑是否受监管机构调查影响"
+        )
+        self.assertEqual(profile["key"], "regulation_review")
+
     def test_risk_detection_uses_embedding_category_when_available(self):
         def fake_embeddings(texts, *args, **kwargs):
             if kwargs["mode"] == "passage":
