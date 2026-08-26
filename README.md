@@ -23,7 +23,7 @@ license: mit
 ```text
 PM Agent（embedding 语义理解目标）
           ↓
-Supervisor Agent（每轮从合法工具集中选择下一步）
+Supervisor Agent（每轮查看完整工具 manifest，再从当前满足前置条件的工具中选择）
           ├── News Scout：FinViz 新闻与市场快照
           ├── Evidence：SEC EDGAR 披露元数据与原文链接
           ├── Quant：标题情绪量化
@@ -34,9 +34,15 @@ Supervisor Agent（每轮从合法工具集中选择下一步）
           需要一手证据时自动补 SEC → 重写 memo → 再检查
 ```
 
-LLM 只可以从当前状态允许的工具中选择动作；目标 profile 与风险类别优先由 embedding 的语义相似度匹配。非法工具、无 API Key、embedding 服务失败或不合法 JSON 都会被记录，并走可解释的关键词规则兜底。这样既支持同义表达，也避免一次模型幻觉造成失控调用。
+每轮 prompt 都会列出新闻、SEC、情绪、风险、memo、Critic 的完整 manifest，以及每项的前置条件/当前可用性。首次请求时，LLM 可以在新闻和 SEC 之间自主决定先查什么；非法动作、无 API Key、embedding 服务失败或不合法 JSON 会被记录，并走可解释的关键词规则兜底。这样既支持同义表达，也避免一次模型幻觉造成失控调用。
 
-例如，一般“风险观察”会在 Critic 通过后结束；“财报指引是否改变逻辑”会触发 SEC 补检索、重写 memo 和二次检查。
+例如，一般“风险观察”会在 Critic 通过后结束；“财报指引是否改变逻辑”可以先触发 SEC，再补新闻、重写 memo 和二次检查。
+
+## 对话记忆与追问
+
+网页用 `st.session_state.messages` 保存当前浏览器会话的用户/助手消息，用 `st.session_state.agent_memory` 保存上一轮的结构化证据（新闻、情绪、风险、SEC、memo、Critic）。用户追问“详细说说那个监管风险”时，Agent 会先把历史对话和上轮 memo 交给 Critic 解析指代；只有 Critic 认为监管一手来源缺失时才补 SEC。它会复用原有新闻、情绪和风险结果，不会重新抓取或重复完整流水线。
+
+点击 **New research conversation**、刷新页面或更换 ticker 会清空这份浏览器会话记忆。
 
 ## 可观测性与任务二素材
 
@@ -88,7 +94,7 @@ python evaluation/run_evaluation.py
 | `analyze_sentiment` | 新闻标题 | 每条情绪、聚合情绪 | 有新闻后需量化叙事倾向时 |
 | `assess_risk` | 情绪新闻、市场快照、用户目标 | 风险等级、语义相似度、信号与匹配度 | 用 embedding 将标题映射到可解释风险 taxonomy；无 key 时回退关键词 |
 | `draft_memo` | 汇总指标、证据、SEC 链接 | 含证据与免责声明的中文 memo | 关键信号已准备好时 |
-| `self_check` | 用户问题、memo、已用证据 | 完整性/证据分、缺口、是否补检索 | 每个 memo 版本生成后 |
+| `self_check` | 用户问题、memo、已用证据、近期消息 | 完整性/证据分、缺口、是否补检索 | 每个 memo 版本生成后；追问时优先执行以解析指代 |
 
 ## 数据源策略
 
