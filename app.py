@@ -1148,7 +1148,7 @@ def detect_risks(
     else:
         level = "Low"
 
-    findings = sorted(
+    displayed_findings = sorted(
         findings,
         key=lambda item: (
             item["focus_match"] != "Yes",
@@ -1160,8 +1160,10 @@ def detect_risks(
     return {
         "level": level,
         "score": round(risk_score),
-        "findings": findings[:8],
-        "focus_matches": sum(1 for item in findings if item["focus_match"] == "Yes"),
+        "findings": displayed_findings[:8],
+        "focus_matches": sum(
+            1 for item in displayed_findings[:8] if item["focus_match"] == "Yes"
+        ),
         "classifier": classifier,
     }
 
@@ -2152,24 +2154,10 @@ def run_workflow(
 
 
 def render_agent_steps(steps):
-    st.subheader("Agent Workflow")
-    progress = st.progress(0)
-    log_area = st.empty()
-    rendered = []
-
+    st.caption("每一步保留决策理由与工具输出，默认收起以避免打断研究结论。")
     for index, step in enumerate(steps, start=1):
-        rendered.append(
-            f"""
-<div class="agent-step">
-  <div class="agent-title">{index}. {step['agent']}</div>
-  <div class="agent-tool">Tool: {step['tool']}</div>
-  <div>{step['output']}</div>
-</div>
-"""
-        )
-        log_area.markdown("\n".join(rendered), unsafe_allow_html=True)
-        progress.progress(index / len(steps))
-        time.sleep(0.2)
+        with st.expander(f"{index}. {step['agent']} · {step['tool']}", expanded=False):
+            st.markdown(step["output"])
 
 
 def render_metrics(result):
@@ -2186,88 +2174,105 @@ def render_metrics(result):
 
 
 def render_dashboard(result):
-    st.subheader("Decision Dashboard")
     goal_profile = result["goal_profile"]
-    st.caption(
-        f"Goal focus: {goal_profile['label']} | "
-        f"Priority areas: {format_categories(goal_profile['priority_categories'])}"
-    )
-    render_metrics(result)
-
     scored_news = result["scored_news"]
     ticker = result["ticker"]
 
-    chart_left, chart_right = st.columns([2, 1])
-    chart_left.plotly_chart(plot_sentiment_timeline(scored_news, ticker), use_container_width=True)
-    chart_right.plotly_chart(plot_sentiment_mix(scored_news), use_container_width=True)
+    conclusion_tab, evidence_tab, workflow_tab, quality_tab = st.tabs(
+        ["研究结论", "风险与证据", "Agent 过程", "质量与追踪"]
+    )
 
-    memo_col, risk_col = st.columns([1.35, 1])
-    with memo_col:
-        st.markdown(result["memo"])
-
-    with risk_col:
-        st.markdown("### Risk Signals")
-        if result["risk"]["findings"]:
-            st.dataframe(pd.DataFrame(result["risk"]["findings"]))
-        else:
-            st.success("当前新闻标题中没有识别到高频风险关键词。")
-
-        st.markdown("### Market Snapshot")
-        snapshot_df = pd.DataFrame(
-            [{"metric": key, "value": value} for key, value in result["snapshot"].items()]
+    with conclusion_tab:
+        st.caption(
+            f"目标：{goal_profile['label']} · 重点：{format_categories(goal_profile['priority_categories'])}"
         )
-        if len(snapshot_df):
-            st.dataframe(snapshot_df)
-        else:
-            st.info("市场快照暂不可用；当前结果主要基于新闻标题。")
+        render_metrics(result)
+        st.divider()
+        # Render the memo only once; historical chat messages use compact receipts.
+        st.markdown(result["memo"])
+        with st.expander("查看情绪图表", expanded=False):
+            chart_left, chart_right = st.columns([2, 1])
+            chart_left.plotly_chart(plot_sentiment_timeline(scored_news, ticker), use_container_width=True)
+            chart_right.plotly_chart(plot_sentiment_mix(scored_news), use_container_width=True)
 
-        st.markdown("### Critic Check")
+    with evidence_tab:
+        risk_col, snapshot_col = st.columns([1.25, 1])
+        with risk_col:
+            st.markdown("### 风险信号")
+            st.caption(f"展示前 {len(result['risk']['findings'])} 条与目标最相关的信号。")
+            if result["risk"]["findings"]:
+                st.dataframe(
+                    pd.DataFrame(result["risk"]["findings"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.success("当前新闻标题中没有识别到高频风险关键词。")
+
+        with snapshot_col:
+            st.markdown("### 市场快照")
+            snapshot_df = pd.DataFrame(
+                [{"metric": key, "value": value} for key, value in result["snapshot"].items()]
+            )
+            if len(snapshot_df):
+                st.dataframe(snapshot_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("市场快照暂不可用；当前结果主要基于新闻标题。")
+
+        sec_filings = (result.get("sec_filings") or {}).get("filings", [])
+        if sec_filings:
+            st.markdown("### 一手来源（SEC EDGAR）")
+            st.dataframe(pd.DataFrame(sec_filings), use_container_width=True, hide_index=True)
+
+        st.markdown("### 新闻证据")
+        table = scored_news.reset_index()
+        table["datetime"] = table["datetime"].dt.strftime("%Y-%m-%d %H:%M")
+        st.dataframe(
+            table[
+                [
+                    "datetime",
+                    "headline",
+                    "sentiment_label",
+                    "sentiment_score",
+                    "neg",
+                    "neu",
+                    "pos",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with workflow_tab:
+        st.subheader("Agent 执行路径")
+        render_agent_steps(result["steps"])
+
+    with quality_tab:
+        st.subheader("Critic 检查")
         critic = result.get("critic") or {}
         if critic:
             st.caption(
-                f"{critic.get('status', 'unknown')} | 答案分 {critic.get('answer_score', 'N/A')} | "
-                f"证据分 {critic.get('evidence_score', 'N/A')} | "
-                f"预期用户下一句：{critic.get('predicted_user_followup', 'N/A')} | "
-                f"{critic.get('judge_source', '')}"
+                f"{critic.get('status', 'unknown')} · 答案分 {critic.get('answer_score', 'N/A')} · "
+                f"证据分 {critic.get('evidence_score', 'N/A')} · "
+                f"预期追问：{critic.get('predicted_user_followup', 'N/A')}"
             )
             st.write(critic.get("reason", ""))
             if critic.get("missing_evidence"):
                 st.warning("待补证据：" + "；".join(critic["missing_evidence"]))
 
-        sec_filings = (result.get("sec_filings") or {}).get("filings", [])
-        if sec_filings:
-            st.markdown("### Primary-source Links")
-            st.dataframe(pd.DataFrame(sec_filings))
-
-    st.markdown("### Evidence Table")
-    table = scored_news.reset_index()
-    table["datetime"] = table["datetime"].dt.strftime("%Y-%m-%d %H:%M")
-    st.dataframe(
-        table[
-            [
-                "datetime",
-                "headline",
-                "sentiment_label",
-                "sentiment_score",
-                "neg",
-                "neu",
-                "pos",
-            ]
-        ]
-    )
-
-    trace_path = Path(result["trace_path"])
-    if trace_path.exists():
-        st.markdown("### Evaluation Trace")
-        st.caption(
-            f"Run: {result['trace_run_id']} · JSONL 中包含每一步的输入、决策、工具调用、输出、耗时和 token 用量。"
-        )
-        st.download_button(
-            "Download JSONL trace",
-            data=trace_path.read_bytes(),
-            file_name=trace_path.name,
-            mime="application/x-ndjson",
-        )
+        trace_path = Path(result["trace_path"])
+        if trace_path.exists():
+            st.divider()
+            st.markdown("### 可审计 Trace")
+            st.caption(
+                f"Run: {result['trace_run_id']} · JSONL 包含工具调用、决策、耗时和 token 用量。"
+            )
+            st.download_button(
+                "下载 JSONL trace",
+                data=trace_path.read_bytes(),
+                file_name=trace_path.name,
+                mime="application/x-ndjson",
+            )
 
 
 def main():
@@ -2341,7 +2346,12 @@ def main():
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                st.caption(message.get("display", "上一轮研究已完成，可继续追问。"))
+                with st.expander("查看上轮研究 memo", expanded=False):
+                    st.markdown(message["content"])
+            else:
+                st.markdown(message["content"])
 
     mission = st.chat_input("输入研究目标或继续追问…")
     if mission:
@@ -2370,12 +2380,18 @@ def main():
                 )
             for warning in result.get("warnings", []):
                 st.warning(warning)
-            st.markdown(result["memo"])
-            st.caption(result["source_note"])
-            render_agent_steps(result["steps"])
             render_dashboard(result)
 
-        st.session_state.messages.append({"role": "assistant", "content": result["memo"]})
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": result["memo"],
+                "display": (
+                    f"已完成 {ticker} 研究 · 数据来源：{result['source_note']} · "
+                    "可继续追问以复用本轮证据。"
+                ),
+            }
+        )
         st.session_state.agent_memory = result["memory"]
         st.session_state.last_result = result
 
