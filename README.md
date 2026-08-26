@@ -21,20 +21,20 @@ license: mit
 旧版本每次都固定执行“目标分类 → FinViz → 情绪 → 风险 → memo”，因此更像串行工作流。本版本保留了可复现的规则兜底，但新增了一个可审计的 Supervisor loop：
 
 ```text
-PM Agent（理解目标）
+PM Agent（embedding 语义理解目标）
           ↓
 Supervisor Agent（每轮从合法工具集中选择下一步）
           ├── News Scout：FinViz 新闻与市场快照
           ├── Evidence：SEC EDGAR 披露元数据与原文链接
           ├── Quant：标题情绪量化
-          ├── Risk：风险信号归纳
+          ├── Risk：embedding 风险类别归纳
           ├── Portfolio Copilot：证据约束下的 memo
           └── Critic：完整性、证据与“用户下一句”检查
                     ↓
           需要一手证据时自动补 SEC → 重写 memo → 再检查
 ```
 
-LLM 只可以从当前状态允许的工具中选择动作；非法工具、无 API Key 或不合法 JSON 都会被记录，并走可解释的规则兜底。这样既保留自适应路径，也避免一次模型幻觉造成失控调用。
+LLM 只可以从当前状态允许的工具中选择动作；目标 profile 与风险类别优先由 embedding 的语义相似度匹配。非法工具、无 API Key、embedding 服务失败或不合法 JSON 都会被记录，并走可解释的关键词规则兜底。这样既支持同义表达，也避免一次模型幻觉造成失控调用。
 
 例如，一般“风险观察”会在 Critic 通过后结束；“财报指引是否改变逻辑”会触发 SEC 补检索、重写 memo 和二次检查。
 
@@ -46,6 +46,7 @@ LLM 只可以从当前状态允许的工具中选择动作；非法工具、无 
 - `input`、简短的 `decision` justification、`tool_call`、`output`
 - `duration_ms` / `elapsed_ms`、LLM `input_tokens` / `output_tokens` / `total_tokens`
 - `error`，以及 Critic 对用户下一句话的预测：`accept` / `ask_for_evidence` / `retry`
+- embedding 的模型、输入文本摘要、耗时与 token；**不记录 API key 或向量值**
 
 这使得后续可以从 trace 计算工具路径正确性、回答与证据完整性、用户满意度代理信号、时延和 token 成本；也能逐条回放低分 case。
 
@@ -56,16 +57,11 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-可选的 LLM 模式（没有 API Key 时仍可用规则模式运行）：
+可选的 LLM 模式不需要在本机配置 API Key：启动页面后，在侧边栏输入 OpenAI API key 和模型即可。密钥只用于当前浏览器会话的请求，不会写入 trace、文件或环境变量；关闭或刷新页面后需要重新输入。
 
-```bash
-export OPENAI_API_KEY="your_api_key"
-export OPENAI_MODEL="gpt-4o-mini"
-export STOCKPILOT_CONTACT_EMAIL="your_email@example.com"
-streamlit run app.py
-```
+默认 embedding 模型是 `text-embedding-3-small`，可以在同一侧边栏更换。输入目标和新闻标题会发送给该模型，用于语义分类；因此它有额外的少量 token 成本。
 
-`STOCKPILOT_CONTACT_EMAIL` 用于标识 SEC EDGAR 请求。也可用 `STOCKPILOT_TRACE_DIR` 改变 trace 的保存目录。
+规则基线模式无需 API Key。`STOCKPILOT_CONTACT_EMAIL`（可选）用于标识 SEC EDGAR 请求；也可用 `STOCKPILOT_TRACE_DIR` 改变 trace 的保存目录。
 
 运行回归测试：
 
@@ -90,7 +86,7 @@ python evaluation/run_evaluation.py
 | `collect_news` | ticker, max_headlines | 新闻标题、链接、市场快照 | 还没有近期外部证据时 |
 | `fetch_sec_filings` | US ticker | 近期 10-K / 10-Q / 8-K 等披露元数据与原文链接 | 财报、监管、公告问题或 Critic 要求一手证据时 |
 | `analyze_sentiment` | 新闻标题 | 每条情绪、聚合情绪 | 有新闻后需量化叙事倾向时 |
-| `assess_risk` | 情绪新闻、市场快照、用户目标 | 风险等级、信号与匹配度 | 需把证据映射到用户关注风险时 |
+| `assess_risk` | 情绪新闻、市场快照、用户目标 | 风险等级、语义相似度、信号与匹配度 | 用 embedding 将标题映射到可解释风险 taxonomy；无 key 时回退关键词 |
 | `draft_memo` | 汇总指标、证据、SEC 链接 | 含证据与免责声明的中文 memo | 关键信号已准备好时 |
 | `self_check` | 用户问题、memo、已用证据 | 完整性/证据分、缺口、是否补检索 | 每个 memo 版本生成后 |
 
