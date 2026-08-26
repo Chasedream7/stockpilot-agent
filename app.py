@@ -32,8 +32,10 @@ SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 TRACE_SCHEMA_VERSION = "1.0"
 MAX_AGENT_STEPS = 10
+RISK_SEMANTIC_THRESHOLD = 0.35
 
 
 class TraceLogger:
@@ -110,6 +112,8 @@ def short_text(value, limit=700):
     value = str(value)
     return value if len(value) <= limit else f"{value[:limit]}… [truncated]"
 
+# These terms are only a no-key / service-failure fallback. Primary classification
+# uses the category descriptions below with embeddings.
 RISK_KEYWORDS = {
     "监管/法律": [
         "regulation",
@@ -151,6 +155,13 @@ RISK_KEYWORDS = {
         "supply chain",
         "tariff",
     ],
+}
+
+RISK_CATEGORY_DESCRIPTIONS = {
+    "监管/法律": "监管调查、反垄断、执法、诉讼、处罚、禁令、证券合规与法律责任风险",
+    "业绩/指引": "财报、收入、利润率、盈利、业绩不及预期、管理层指引、预测下调与展望风险",
+    "需求/竞争": "客户需求放缓、竞争加剧、竞品、市场份额流失、价格压力、折扣与产品替代风险",
+    "宏观/融资": "利率、通胀、衰退、债务、信用、关税、供应链与宏观经济冲击风险",
 }
 
 DEFAULT_GOAL_PROFILE = {
@@ -333,8 +344,7 @@ def get_config_value(name, default=None):
         return default
 
 
-def get_openai_client():
-    api_key = get_config_value("OPENAI_API_KEY")
+def get_openai_client(api_key=None):
     if OpenAI is None or not api_key:
         return None
     return OpenAI(api_key=api_key)
@@ -658,8 +668,74 @@ def extract_usage(response):
     }
 
 
-def call_llm_text(system_prompt, user_prompt, model, trace=None, agent="LLM", step="llm_call"):
-    client = get_openai_client()
+def extract_embedding_usage(response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    input_tokens = getattr(usage, "prompt_tokens", None)
+    if input_tokens is None:
+        input_tokens = getattr(usage, "input_tokens", None)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": 0,
+        "total_tokens": getattr(usage, "total_tokens", input_tokens),
+    }
+
+
+def cosine_similarity(left, right):
+    numerator = sum(a * b for a, b in zip(left, right))
+    left_norm = sum(a * a for a in left) ** 0.5
+    right_norm = sum(b * b for b in right) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def embed_texts(texts, api_key, model, trace=None, agent="Embedding Router", step="embedding"):
+    """Create a small batch of vectors and trace metadata, never vectors or API keys."""
+    client = get_openai_client(api_key)
+    if client is None:
+        return None
+
+    started_at = time.perf_counter()
+    try:
+        response = client.embeddings.create(model=model, input=texts)
+        vectors = [item.embedding for item in response.data]
+    except Exception as error:
+        if trace:
+            trace.record(
+                "embedding_call_failed",
+                step=step,
+                agent=agent,
+                input_data={"model": model, "texts": [short_text(text, 240) for text in texts]},
+                error=error,
+                duration_ms=(time.perf_counter() - started_at) * 1000,
+            )
+        raise
+
+    if trace:
+        trace.record(
+            "embedding_call",
+            step=step,
+            agent=agent,
+            input_data={"model": model, "texts": [short_text(text, 240) for text in texts]},
+            output={"vector_count": len(vectors), "dimensions": len(vectors[0]) if vectors else 0},
+            usage=extract_embedding_usage(response),
+            duration_ms=(time.perf_counter() - started_at) * 1000,
+        )
+    return vectors
+
+
+def call_llm_text(
+    system_prompt,
+    user_prompt,
+    model,
+    trace=None,
+    agent="LLM",
+    step="llm_call",
+    api_key=None,
+):
+    client = get_openai_client(api_key)
     if client is None:
         return None
 
@@ -706,7 +782,15 @@ def call_llm_text(system_prompt, user_prompt, model, trace=None, agent="LLM", st
     return output
 
 
-def call_llm_json(system_prompt, user_prompt, model, trace=None, agent="LLM", step="llm_json"):
+def call_llm_json(
+    system_prompt,
+    user_prompt,
+    model,
+    trace=None,
+    agent="LLM",
+    step="llm_json",
+    api_key=None,
+):
     output = call_llm_text(
         system_prompt,
         user_prompt,
@@ -714,6 +798,7 @@ def call_llm_json(system_prompt, user_prompt, model, trace=None, agent="LLM", st
         trace=trace,
         agent=agent,
         step=step,
+        api_key=api_key,
     )
     parsed = extract_json_object(output)
     if trace:
@@ -726,7 +811,54 @@ def call_llm_json(system_prompt, user_prompt, model, trace=None, agent="LLM", st
     return parsed
 
 
-def infer_goal_profile_with_llm(mission, model, trace=None):
+def profile_embedding_text(profile):
+    return (
+        f"投资研究目标：{profile['label']}。{profile['description']}。"
+        f"优先关注：{format_categories(profile['priority_categories'])}。"
+    )
+
+
+def infer_goal_profile_with_embedding(mission, model, trace=None, api_key=None):
+    """Route an open-ended goal by semantic similarity, not keyword membership."""
+    if not mission.strip():
+        return None
+    profiles = [DEFAULT_GOAL_PROFILE] + GOAL_PROFILES
+    vectors = embed_texts(
+        [mission] + [profile_embedding_text(profile) for profile in profiles],
+        api_key,
+        model,
+        trace=trace,
+        agent="PM Agent",
+        step="goal_embedding",
+    )
+    if not vectors or len(vectors) != len(profiles) + 1:
+        return None
+
+    similarities = [cosine_similarity(vectors[0], vector) for vector in vectors[1:]]
+    best_index = max(range(len(profiles)), key=lambda index: similarities[index])
+    profile = dict(profiles[best_index])
+    alternatives = sorted(
+        (
+            {"profile_key": candidate["key"], "similarity": round(similarities[index], 3)}
+            for index, candidate in enumerate(profiles)
+        ),
+        key=lambda item: item["similarity"],
+        reverse=True,
+    )[:3]
+    profile["analysis_source"] = "Embedding semantic router"
+    profile["llm_reason"] = f"语义相似度 {similarities[best_index]:.3f}，最接近“{profile['label']}”。"
+    if trace:
+        trace.record(
+            "semantic_match",
+            step="goal_analysis",
+            agent="PM Agent",
+            input_data={"mission": mission, "embedding_model": model},
+            output={"selected_profile": profile["key"], "alternatives": alternatives},
+        )
+    return profile
+
+
+def infer_goal_profile_with_llm(mission, model, trace=None, api_key=None):
     system_prompt = """
 You are the goal analysis agent for StockPilot Agent.
 Map the user's natural-language investing research goal to exactly one supported goal profile.
@@ -753,6 +885,7 @@ Rules:
         trace=trace,
         agent="PM Agent",
         step="goal_analysis",
+        api_key=api_key,
     )
     if not parsed:
         return None
@@ -767,10 +900,34 @@ Rules:
     return enriched
 
 
-def analyze_goal(mission, use_llm, model, trace=None):
+def analyze_goal(
+    mission,
+    use_llm,
+    model,
+    trace=None,
+    api_key=None,
+    embedding_model=DEFAULT_EMBEDDING_MODEL,
+):
     if use_llm:
         try:
-            profile = infer_goal_profile_with_llm(mission, model, trace=trace)
+            profile = infer_goal_profile_with_embedding(
+                mission,
+                embedding_model,
+                trace=trace,
+                api_key=api_key,
+            )
+            if profile:
+                return profile, "Embedding goal router"
+        except Exception as error:
+            if trace:
+                trace.record(
+                    "semantic_match_failed",
+                    step="goal_analysis",
+                    agent="PM Agent",
+                    error=error,
+                )
+        try:
+            profile = infer_goal_profile_with_llm(mission, model, trace=trace, api_key=api_key)
             if profile:
                 return profile, "LLM goal analysis"
         except Exception as error:
@@ -782,7 +939,7 @@ def analyze_goal(mission, use_llm, model, trace=None):
     profile = dict(infer_goal_profile(mission))
     profile["analysis_source"] = "Rule fallback"
     if use_llm:
-        profile["llm_reason"] = "OPENAI_API_KEY is not configured or openai package is unavailable."
+        profile["llm_reason"] = "未输入 API Key 或 openai package 不可用。"
         return profile, "Rule fallback because LLM is unavailable"
     profile["llm_reason"] = "LLM mode is off."
     return profile, "Rule-based goal parser"
@@ -796,8 +953,8 @@ def build_next_steps(goal_profile):
     return "\n".join([f"- {step}" for step in goal_profile["next_steps"]])
 
 
-def detect_risks(scored_news, snapshot, goal_profile):
-    priority_categories = set(goal_profile["priority_categories"])
+def keyword_risk_findings(scored_news, priority_categories):
+    """Deterministic fallback for offline runs and embedding service failures."""
     findings = []
     for _, row in scored_news.reset_index().iterrows():
         headline = row["headline"]
@@ -810,10 +967,83 @@ def detect_risks(scored_news, snapshot, goal_profile):
                         "category": category,
                         "headline": headline,
                         "matched_signal": ", ".join(matched[:3]),
+                        "similarity": None,
+                        "classification_source": "keyword fallback",
                         "sentiment_score": round(row["sentiment_score"], 3),
                         "focus_match": "Yes" if category in priority_categories else "No",
                     }
                 )
+    return findings
+
+
+def semantic_risk_findings(scored_news, priority_categories, api_key, embedding_model, trace=None):
+    """Assign each headline to its closest risk theme using a single embedding batch."""
+    categories = list(RISK_CATEGORY_DESCRIPTIONS)
+    headlines = scored_news.reset_index().to_dict("records")
+    vectors = embed_texts(
+        list(RISK_CATEGORY_DESCRIPTIONS.values()) + [row["headline"] for row in headlines],
+        api_key,
+        embedding_model,
+        trace=trace,
+        agent="Risk Agent",
+        step="risk_embedding",
+    )
+    if not vectors or len(vectors) != len(categories) + len(headlines):
+        return None
+
+    category_vectors = vectors[: len(categories)]
+    findings = []
+    for row, headline_vector in zip(headlines, vectors[len(categories) :]):
+        similarities = [cosine_similarity(headline_vector, vector) for vector in category_vectors]
+        best_index = max(range(len(categories)), key=lambda index: similarities[index])
+        best_score = similarities[best_index]
+        if best_score < RISK_SEMANTIC_THRESHOLD:
+            continue
+        category = categories[best_index]
+        findings.append(
+            {
+                "category": category,
+                "headline": row["headline"],
+                "matched_signal": f"semantic similarity {best_score:.3f}",
+                "similarity": round(best_score, 3),
+                "classification_source": "embedding semantic classifier",
+                "sentiment_score": round(row["sentiment_score"], 3),
+                "focus_match": "Yes" if category in priority_categories else "No",
+            }
+        )
+    return findings
+
+
+def detect_risks(
+    scored_news,
+    snapshot,
+    goal_profile,
+    api_key=None,
+    embedding_model=DEFAULT_EMBEDDING_MODEL,
+    trace=None,
+):
+    priority_categories = set(goal_profile["priority_categories"])
+    classifier = "embedding semantic classifier"
+    try:
+        findings = semantic_risk_findings(
+            scored_news,
+            priority_categories,
+            api_key,
+            embedding_model,
+            trace=trace,
+        )
+    except Exception as error:
+        if trace:
+            trace.record(
+                "semantic_match_failed",
+                step="risk_analysis",
+                agent="Risk Agent",
+                error=error,
+            )
+        findings = None
+    if findings is None:
+        classifier = "keyword fallback"
+        findings = keyword_risk_findings(scored_news, priority_categories)
 
     change = parse_percent(snapshot.get("Change", ""))
     volatility_points = 0
@@ -824,6 +1054,8 @@ def detect_risks(scored_news, snapshot, goal_profile):
                 "category": "价格波动",
                 "headline": f"FinViz shows intraday change of {change:.2f}%.",
                 "matched_signal": "large price move",
+                "similarity": None,
+                "classification_source": "price-move rule",
                 "sentiment_score": 0,
                 "focus_match": "Yes" if "价格波动" in priority_categories else "No",
             }
@@ -845,7 +1077,11 @@ def detect_risks(scored_news, snapshot, goal_profile):
 
     findings = sorted(
         findings,
-        key=lambda item: (item["focus_match"] != "Yes", item["sentiment_score"]),
+        key=lambda item: (
+            item["focus_match"] != "Yes",
+            -(item["similarity"] or 0),
+            item["sentiment_score"],
+        ),
     )
 
     return {
@@ -853,6 +1089,7 @@ def detect_risks(scored_news, snapshot, goal_profile):
         "score": round(risk_score),
         "findings": findings[:8],
         "focus_matches": sum(1 for item in findings if item["focus_match"] == "Yes"),
+        "classifier": classifier,
     }
 
 
@@ -956,6 +1193,7 @@ def build_llm_memo(
     model,
     sec_filings=None,
     trace=None,
+    api_key=None,
 ):
     system_prompt = """
 You are Portfolio Copilot inside StockPilot Agent.
@@ -1014,6 +1252,7 @@ Data:
         trace=trace,
         agent="Portfolio Copilot",
         step="memo_generation",
+        api_key=api_key,
     )
 
 
@@ -1030,6 +1269,7 @@ def build_memo(
     model,
     sec_filings=None,
     trace=None,
+    api_key=None,
 ):
     if use_llm:
         try:
@@ -1045,6 +1285,7 @@ def build_memo(
                 model,
                 sec_filings=sec_filings,
                 trace=trace,
+                api_key=api_key,
             )
             if memo:
                 return memo.strip(), "LLM memo generator"
@@ -1230,12 +1471,12 @@ def rule_next_action(state):
     return "finish", "当前 memo 已完成检查，且没有可执行的补证据请求。"
 
 
-def decide_next_action(state, use_llm, model, trace):
+def decide_next_action(state, use_llm, model, trace, api_key=None):
     fallback_action, fallback_reason = rule_next_action(state)
     available = valid_actions(state)
     if fallback_action not in available:
         fallback_action = available[0]
-    if not use_llm or get_openai_client() is None:
+    if not use_llm or get_openai_client(api_key) is None:
         decision = {
             "action": fallback_action,
             "reason": fallback_reason,
@@ -1282,6 +1523,7 @@ Rules:
         trace=trace,
         agent="Supervisor Agent",
         step=f"planner_{state['tool_steps'] + 1}",
+        api_key=api_key,
     )
     action = (parsed or {}).get("action")
     reason = (parsed or {}).get("reason")
@@ -1334,8 +1576,8 @@ def fallback_critic_check(state):
     }
 
 
-def self_check_memo(state, use_llm, model, trace):
-    if not use_llm or get_openai_client() is None:
+def self_check_memo(state, use_llm, model, trace, api_key=None):
+    if not use_llm or get_openai_client(api_key) is None:
         return fallback_critic_check(state)
 
     system_prompt = """
@@ -1364,6 +1606,7 @@ regulatory, filing, or management-disclosure claim that headlines alone cannot s
         trace=trace,
         agent="Critic Agent",
         step=f"self_check_{state['memo_version']}",
+        api_key=api_key,
     )
     if not parsed or parsed.get("status") not in {"pass", "needs_more_evidence"}:
         fallback = fallback_critic_check(state)
@@ -1400,7 +1643,15 @@ regulatory, filing, or management-disclosure claim that headlines alone cannot s
     }
 
 
-def execute_tool(action, state, use_llm, model, trace):
+def execute_tool(
+    action,
+    state,
+    use_llm,
+    model,
+    trace,
+    api_key=None,
+    embedding_model=DEFAULT_EMBEDDING_MODEL,
+):
     step_number = state["tool_steps"] + 1
     agent = AGENT_TOOLS[action]["agent"]
     started_at = time.perf_counter()
@@ -1457,13 +1708,18 @@ def execute_tool(action, state, use_llm, model, trace):
 
         elif action == "assess_risk":
             state["risk"] = detect_risks(
-                state["scored_news"], state["snapshot"], state["goal_profile"]
+                state["scored_news"],
+                state["snapshot"],
+                state["goal_profile"],
+                api_key=api_key,
+                embedding_model=embedding_model,
+                trace=trace,
             )
             detail = (
                 f"识别到 {len(state['risk']['findings'])} 个风险信号，其中 "
                 f"{state['risk']['focus_matches']} 个与当前分析重点直接相关；综合风险等级为 {state['risk']['level']}。"
             )
-            tool_label = "Keyword risk scanner"
+            tool_label = state["risk"]["classifier"]
             output = state["risk"]
 
         elif action == "draft_memo":
@@ -1480,6 +1736,7 @@ def execute_tool(action, state, use_llm, model, trace):
                 model,
                 sec_filings=state.get("sec_filings"),
                 trace=trace,
+                api_key=api_key,
             )
             state["memo"] = memo
             state["memo_tool"] = tool_label
@@ -1489,7 +1746,7 @@ def execute_tool(action, state, use_llm, model, trace):
             output = {"memo_version": state["memo_version"], "memo": memo, "generator": tool_label}
 
         elif action == "self_check":
-            state["critic"] = self_check_memo(state, use_llm, model, trace)
+            state["critic"] = self_check_memo(state, use_llm, model, trace, api_key=api_key)
             state["reviewed_memo_version"] = state["memo_version"]
             state["revision_requested"] = bool(state["critic"].get("should_retrieve")) and not state["sec_attempted"]
             detail = (
@@ -1533,6 +1790,8 @@ def run_workflow(
     use_llm=False,
     llm_model=DEFAULT_LLM_MODEL,
     trace_dir=None,
+    api_key=None,
+    embedding_model=DEFAULT_EMBEDDING_MODEL,
 ):
     """Run an inspectable supervisor loop instead of a fixed, always-five-step pipeline."""
     trace = TraceLogger(trace_dir=trace_dir)
@@ -1547,10 +1806,18 @@ def run_workflow(
             "allow_fallback_data": allow_fallback_data,
             "llm_enabled": use_llm,
             "llm_model": llm_model,
+            "embedding_model": embedding_model,
         },
     )
     goal_started_at = time.perf_counter()
-    goal_profile, goal_tool = analyze_goal(mission, use_llm, llm_model, trace=trace)
+    goal_profile, goal_tool = analyze_goal(
+        mission,
+        use_llm,
+        llm_model,
+        trace=trace,
+        api_key=api_key,
+        embedding_model=embedding_model,
+    )
     trace.record(
         "tool_completed",
         step=0,
@@ -1596,7 +1863,7 @@ def run_workflow(
 
     terminal_reason = ""
     while state["tool_steps"] < MAX_AGENT_STEPS:
-        decision = decide_next_action(state, use_llm, llm_model, trace)
+        decision = decide_next_action(state, use_llm, llm_model, trace, api_key=api_key)
         if decision["action"] == "finish":
             terminal_reason = decision["reason"]
             steps.append(
@@ -1608,7 +1875,17 @@ def run_workflow(
                 }
             )
             break
-        steps.append(execute_tool(decision["action"], state, use_llm, llm_model, trace))
+        steps.append(
+            execute_tool(
+                decision["action"],
+                state,
+                use_llm,
+                llm_model,
+                trace,
+                api_key=api_key,
+                embedding_model=embedding_model,
+            )
+        )
     else:
         terminal_reason = f"达到 {MAX_AGENT_STEPS} 步上限，为防止循环而停止。"
         steps.append(
@@ -1824,14 +2101,28 @@ def main():
         st.caption("Examples: holding risk / positive catalysts / earnings signals / regulation and lawsuits")
         max_headlines = st.slider("Headlines to analyze", 6, 30, 16)
         use_llm = st.checkbox("Use LLM for goal analysis and memo", value=True)
-        llm_model = st.text_input("LLM model", get_config_value("OPENAI_MODEL", DEFAULT_LLM_MODEL))
-        st.caption("Set OPENAI_API_KEY in your environment or Streamlit secrets. Without it, the app uses rule-based fallback.")
+        api_key = st.text_input(
+            "OpenAI API key",
+            type="password",
+            disabled=not use_llm,
+            help="仅在当前浏览器会话中用于本次请求；不会写入 trace、文件或环境变量。",
+        )
+        llm_model = st.text_input("LLM model", DEFAULT_LLM_MODEL, disabled=not use_llm)
+        embedding_model = st.text_input(
+            "Embedding model", DEFAULT_EMBEDDING_MODEL, disabled=not use_llm
+        )
+        st.caption(
+            "密钥仅保留在当前浏览器会话中。开启 LLM 时，会用 embedding 对目标和新闻风险做语义匹配；关闭或刷新页面后需重新输入密钥。"
+        )
         allow_fallback_data = st.checkbox("Use offline sample data if live fetch fails", value=False)
         run_button = st.button("Run Agent Workflow")
 
     if run_button:
         if not ticker:
             st.warning("Please enter a stock ticker.")
+            return
+        if use_llm and not api_key.strip():
+            st.warning("请输入 OpenAI API key，或关闭 LLM 模式后使用规则基线运行。")
             return
 
         with st.spinner("StockPilot Agent 正在运行..."):
@@ -1842,6 +2133,8 @@ def main():
                 allow_fallback_data,
                 use_llm,
                 llm_model,
+                api_key=api_key.strip(),
+                embedding_model=embedding_model,
             )
 
         st.caption(result["source_note"])
