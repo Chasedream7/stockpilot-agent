@@ -249,6 +249,46 @@ GOAL_PROFILES = [
     },
 ]
 
+HIGH_SIGNAL_PROFILE_RULES = {
+    "regulation_review": [
+        "监管",
+        "反垄断",
+        "诉讼",
+        "调查",
+        "合规",
+        "法律",
+        "sec",
+        "公告",
+        "regulation",
+        "antitrust",
+        "lawsuit",
+        "investigation",
+        "compliance",
+        "filing",
+    ],
+    "earnings_review": [
+        "财报",
+        "业绩",
+        "营收",
+        "利润",
+        "指引",
+        "earnings",
+        "revenue",
+        "guidance",
+        "margin",
+    ],
+    "competition_review": [
+        "竞争",
+        "需求",
+        "市场份额",
+        "对手",
+        "competition",
+        "demand",
+        "rival",
+        "market share",
+    ],
+}
+
 POSITIVE_WORDS = {
     "accelerate",
     "accelerates",
@@ -661,6 +701,14 @@ def infer_goal_profile(mission):
     if not text:
         return DEFAULT_GOAL_PROFILE
 
+    # High-signal topic words should beat generic words such as “风险” or
+    # “复盘”.  This is especially important for short follow-ups like
+    # “详细说说那个监管风险”: the user is narrowing the topic to regulation,
+    # not starting another generic risk scan.
+    for profile_key, signals in HIGH_SIGNAL_PROFILE_RULES.items():
+        if any(signal in text for signal in signals):
+            return profile_by_key(profile_key)
+
     best_profile = DEFAULT_GOAL_PROFILE
     best_score = 0
     for profile in GOAL_PROFILES:
@@ -919,6 +967,54 @@ def infer_goal_profile_with_embedding(mission, trace=None):
         similarity + min(0.18, match_count * 0.06)
         for similarity, match_count in zip(similarities, explicit_matches)
     ]
+    # Embeddings are the primary router, but short follow-ups need a
+    # deterministic high-signal guardrail.  A phrase such as “监管风险” can
+    # be closer to the generic risk profile in vector space; the concrete
+    # regulatory topic must win that near-tie.
+    high_signal_boosts = {
+        "regulation_review": [
+            "监管",
+            "反垄断",
+            "诉讼",
+            "调查",
+            "合规",
+            "法律",
+            "sec",
+            "公告",
+            "regulation",
+            "antitrust",
+            "lawsuit",
+            "investigation",
+            "compliance",
+            "filing",
+        ],
+        "earnings_review": [
+            "财报",
+            "业绩",
+            "营收",
+            "利润",
+            "指引",
+            "earnings",
+            "revenue",
+            "guidance",
+            "margin",
+        ],
+        "competition_review": [
+            "竞争",
+            "需求",
+            "市场份额",
+            "对手",
+            "competition",
+            "demand",
+            "rival",
+            "market share",
+        ],
+    }
+    for index, candidate in enumerate(profiles):
+        signals = high_signal_boosts.get(candidate["key"], [])
+        signal_count = sum(1 for signal in signals if signal in normalized_mission)
+        if signal_count:
+            adjusted_scores[index] += min(0.3, signal_count * 0.15)
     best_index = max(range(len(profiles)), key=lambda index: adjusted_scores[index])
     profile = dict(profiles[best_index])
     alternatives = sorted(
@@ -1000,6 +1096,18 @@ def analyze_goal(
     api_key=None,
 ):
     if use_llm:
+        # Resolve concrete topic changes before consulting a probabilistic
+        # router.  This keeps short follow-ups deterministic even when the
+        # local embedding model is unavailable or the provider returns a
+        # generic profile.
+        high_signal_profile = infer_goal_profile(mission)
+        if high_signal_profile["key"] != DEFAULT_GOAL_PROFILE["key"]:
+            high_signal_profile = dict(high_signal_profile)
+            high_signal_profile["analysis_source"] = "High-signal intent guardrail"
+            high_signal_profile["llm_reason"] = (
+                "检测到明确的监管、财报或竞争主题词，优先切换到对应分析重点。"
+            )
+            return high_signal_profile, "High-signal intent router"
         try:
             profile = infer_goal_profile_with_embedding(mission, trace=trace)
             if profile:
@@ -2035,6 +2143,10 @@ def build_conversation_memory(state):
     """Keep structured evidence in Streamlit session state for follow-up questions."""
     fields = [
         "ticker",
+        "mission",
+        "goal_profile",
+        "previous_goal_profile",
+        "goal_changed",
         "source_note",
         "snapshot",
         "news_df",
@@ -2092,6 +2204,11 @@ def run_workflow(
         trace=trace,
         api_key=api_key,
     )
+    previous_goal_profile = (prior_memory or {}).get("goal_profile")
+    goal_changed = bool(
+        previous_goal_profile
+        and previous_goal_profile.get("key") != goal_profile.get("key")
+    )
     trace.record(
         "tool_completed",
         step=0,
@@ -2107,7 +2224,21 @@ def run_workflow(
             "output": (
                 f"识别到分析重点：{goal_profile['label']}。"
                 f"优先关注：{format_categories(goal_profile['priority_categories'])}。"
-                f"{'原因：' + goal_profile.get('llm_reason', '') if goal_profile.get('llm_reason') else ''}"
+                + (
+                    f"本轮目标已从“{previous_goal_profile['label']}”切换到"
+                    f"“{goal_profile['label']}”。"
+                    if goal_changed
+                    else (
+                        "本轮沿用上一轮分析重点。"
+                        if previous_goal_profile
+                        else ""
+                    )
+                )
+                + (
+                    f"原因：{goal_profile.get('llm_reason', '')}"
+                    if goal_profile.get("llm_reason")
+                    else ""
+                )
             ),
             "action": "analyze_goal",
             "raw_output": goal_profile,
@@ -2120,6 +2251,8 @@ def run_workflow(
         "max_headlines": max_headlines,
         "allow_fallback_data": allow_fallback_data,
         "goal_profile": goal_profile,
+        "previous_goal_profile": previous_goal_profile,
+        "goal_changed": goal_changed,
         "source_note": (prior_memory or {}).get("source_note", "Evidence has not been collected yet."),
         "snapshot": (prior_memory or {}).get("snapshot", {}),
         "news_df": (prior_memory or {}).get("news_df"),
@@ -2213,6 +2346,9 @@ def run_workflow(
         "ticker": ticker,
         "mission": mission,
         "goal_profile": goal_profile,
+        "previous_goal_profile": previous_goal_profile,
+        "goal_changed": goal_changed,
+        "is_follow_up": is_follow_up,
         "source_note": state["source_note"],
         "snapshot": state["snapshot"],
         "scored_news": state["scored_news"],
@@ -2282,6 +2418,14 @@ def render_dashboard(result):
         st.caption(
             f"目标：{goal_profile['label']} · 重点：{format_categories(goal_profile['priority_categories'])}"
         )
+        if result.get("goal_changed"):
+            previous = result.get("previous_goal_profile") or {}
+            st.info(
+                f"本轮追问已切换分析目标："
+                f"“{previous.get('label', '上一轮目标')}” → “{goal_profile['label']}”。"
+            )
+        elif result.get("is_follow_up"):
+            st.caption("本轮追问沿用上一轮目标，但会优先回答最新问题并复用已有证据。")
         render_metrics(result)
         st.divider()
         # Render the memo only once; historical chat messages use compact receipts.
