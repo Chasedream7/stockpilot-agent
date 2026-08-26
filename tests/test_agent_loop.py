@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import app
 import pandas as pd
@@ -182,18 +183,63 @@ class SemanticRoutingTest(unittest.TestCase):
         self.assertEqual(risk["findings"][0]["classification_source"], "embedding semantic classifier")
 
 
+class CompassSDKContractTest(unittest.TestCase):
+    def setUp(self):
+        self.original_openai = app.OpenAI
+        self.original_client = app.get_compass_client
+
+    def tearDown(self):
+        app.OpenAI = self.original_openai
+        app.get_compass_client = self.original_client
+
+    def test_compass_client_uses_compatibility_base_url(self):
+        captured = {}
+
+        def fake_openai(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        app.OpenAI = fake_openai
+        app.get_compass_client("compass-test-key")
+
+        self.assertEqual(captured["api_key"], "compass-test-key")
+        self.assertEqual(captured["base_url"], app.COMPASS_BASE_URL)
+
+    def test_llm_call_uses_chat_completions_not_responses(self):
+        captured = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="{\"action\": \"finish\"}"))],
+                    usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+                )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+        app.get_compass_client = lambda api_key=None: fake_client
+        output = app.call_llm_text("system prompt", "user prompt", "compass-v2", api_key="key")
+
+        self.assertEqual(output, '{"action": "finish"}')
+        self.assertEqual(captured["model"], "compass-v2")
+        self.assertEqual(captured["messages"][0]["role"], "system")
+        self.assertEqual(captured["messages"][1]["role"], "user")
+
+
 class SupervisorPlannerTest(unittest.TestCase):
     def setUp(self):
-        self.original_client = app.get_openai_client
+        self.original_client = app.get_compass_client
         self.original_json_call = app.call_llm_json
-        app.get_openai_client = lambda api_key=None: object()
+        app.get_compass_client = lambda api_key=None: object()
         app.call_llm_json = lambda *args, **kwargs: {
             "action": "fetch_sec_filings",
             "reason": "财报问题应先取一手披露。",
         }
 
     def tearDown(self):
-        app.get_openai_client = self.original_client
+        app.get_compass_client = self.original_client
         app.call_llm_json = self.original_json_call
 
     def test_llm_can_choose_sec_as_the_first_tool_from_complete_manifest(self):
