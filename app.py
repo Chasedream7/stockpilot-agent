@@ -26,18 +26,21 @@ try:
 except ImportError:
     OpenAI = None
 
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
+
 
 FINVIZ_URL = "https://finviz.com/quote.ashx?t="
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
-COMPASS_BASE_URL = "https://compass.llm.shopee.io/compass-api/v1"
-DEFAULT_LLM_MODEL = "compass-v2"
-DEFAULT_EMBEDDING_MODEL = "compass-embedding-v3"
-COMPASS_EMBEDDING_DIMENSIONS = 384
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+LOCAL_EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
 TRACE_SCHEMA_VERSION = "1.0"
 MAX_AGENT_STEPS = 10
-RISK_SEMANTIC_THRESHOLD = 0.35
 
 
 class TraceLogger:
@@ -114,8 +117,8 @@ def short_text(value, limit=700):
     value = str(value)
     return value if len(value) <= limit else f"{value[:limit]}… [truncated]"
 
-# These terms are only a no-key / service-failure fallback. Primary classification
-# uses the category descriptions below with embeddings.
+# These terms are only a no-key / local-embedding-failure fallback. Primary
+# classification uses the local multilingual embedding model below.
 RISK_KEYWORDS = {
     "监管/法律": [
         "regulation",
@@ -337,6 +340,14 @@ def cache_resource(func):
     return st.cache(allow_output_mutation=True)(func)
 
 
+@cache_resource
+def get_local_embedding_model():
+    """Download once on the host, then reuse a free multilingual local encoder."""
+    if SentenceTransformer is None:
+        return None
+    return SentenceTransformer(LOCAL_EMBEDDING_MODEL)
+
+
 def get_config_value(name, default=None):
     if os.environ.get(name):
         return os.environ[name]
@@ -346,10 +357,11 @@ def get_config_value(name, default=None):
         return default
 
 
-def get_compass_client(api_key=None):
+def get_deepseek_client(api_key=None):
+    """DeepSeek exposes an OpenAI-compatible Chat Completions API."""
     if OpenAI is None or not api_key:
         return None
-    return OpenAI(api_key=api_key, base_url=COMPASS_BASE_URL)
+    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
 
 
 def is_llm_capacity_error(error):
@@ -363,11 +375,11 @@ def llm_failure_notice(error):
     """A user-safe message; never echo provider error text or credentials."""
     if is_llm_capacity_error(error):
         return (
-            "Compass LLM 当前返回 429（请求限流、项目配额或模型权限不可用）。"
-            "本轮已自动切换到规则基线，研究仍会完成；请检查 Compass Key 是否已获批、"
-            "项目是否获授权调用所选模型，或等待限流窗口重置后重试。"
+            "DeepSeek API 当前返回 429（请求限流或账户余额不足）。"
+            "本轮已自动切换到规则基线，研究仍会完成；请检查 DeepSeek 账户余额、"
+            "限流状态和所选模型，或等待限流窗口重置后重试。"
         )
-    return "Compass LLM API 本轮不可用，已自动切换到规则基线，研究仍会完成。"
+    return "DeepSeek API 本轮不可用，已自动切换到规则基线，研究仍会完成。"
 
 
 def disable_llm_for_run(state, error, trace, stage):
@@ -698,35 +710,29 @@ def extract_json_object(text):
 def extract_usage(response):
     usage = getattr(response, "usage", None)
     if usage is None:
+        usage = getattr(response, "usage_metadata", None)
+    if usage is None:
         return {}
     input_tokens = getattr(usage, "input_tokens", None)
     if input_tokens is None:
         input_tokens = getattr(usage, "prompt_tokens", None)
+    if input_tokens is None:
+        input_tokens = getattr(usage, "prompt_token_count", None)
     output_tokens = getattr(usage, "output_tokens", None)
     if output_tokens is None:
         output_tokens = getattr(usage, "completion_tokens", None)
+    if output_tokens is None:
+        output_tokens = getattr(usage, "candidates_token_count", None)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-        "total_tokens": getattr(usage, "total_tokens", None),
-    }
-
-
-def extract_embedding_usage(response):
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return {}
-    input_tokens = getattr(usage, "prompt_tokens", None)
-    if input_tokens is None:
-        input_tokens = getattr(usage, "input_tokens", None)
-    return {
-        "input_tokens": input_tokens,
-        "output_tokens": 0,
-        "total_tokens": getattr(usage, "total_tokens", input_tokens),
+        "total_tokens": getattr(usage, "total_tokens", getattr(usage, "total_token_count", None)),
     }
 
 
 def cosine_similarity(left, right):
+    if not left or not right or len(left) != len(right):
+        return 0.0
     numerator = sum(a * b for a, b in zip(left, right))
     left_norm = sum(a * a for a in left) ** 0.5
     right_norm = sum(b * b for b in right) ** 0.5
@@ -735,40 +741,38 @@ def cosine_similarity(left, right):
     return numerator / (left_norm * right_norm)
 
 
-def embed_texts(texts, api_key, model, trace=None, agent="Embedding Router", step="embedding"):
-    """Create a small batch of vectors and trace metadata, never vectors or API keys."""
-    client = get_compass_client(api_key)
-    if client is None:
+def embed_texts(texts, trace=None, agent="Embedding Router", step="embedding", mode="passage"):
+    """Embed text locally; no API key, vectors, or raw model weights enter traces."""
+    encoder = get_local_embedding_model()
+    if encoder is None:
         return None
-
+    prefix = "query: " if mode == "query" else "passage: "
     started_at = time.perf_counter()
     try:
-        response = client.embeddings.create(
-            model=model,
-            input=texts,
-            dimensions=COMPASS_EMBEDDING_DIMENSIONS,
+        encoded = encoder.encode(
+            [f"{prefix}{text}" for text in texts],
+            normalize_embeddings=True,
+            show_progress_bar=False,
         )
-        vectors = [item.embedding for item in response.data]
+        vectors = encoded.tolist() if hasattr(encoded, "tolist") else list(encoded)
     except Exception as error:
         if trace:
             trace.record(
-                "embedding_call_failed",
+                "local_embedding_failed",
                 step=step,
                 agent=agent,
-                input_data={"model": model, "texts": [short_text(text, 240) for text in texts]},
+                input_data={"model": LOCAL_EMBEDDING_MODEL, "mode": mode, "text_count": len(texts)},
                 error=error,
                 duration_ms=(time.perf_counter() - started_at) * 1000,
             )
         raise
-
     if trace:
         trace.record(
-            "embedding_call",
+            "local_embedding",
             step=step,
             agent=agent,
-            input_data={"model": model, "texts": [short_text(text, 240) for text in texts]},
+            input_data={"model": LOCAL_EMBEDDING_MODEL, "mode": mode, "text_count": len(texts)},
             output={"vector_count": len(vectors), "dimensions": len(vectors[0]) if vectors else 0},
-            usage=extract_embedding_usage(response),
             duration_ms=(time.perf_counter() - started_at) * 1000,
         )
     return vectors
@@ -782,19 +786,26 @@ def call_llm_text(
     agent="LLM",
     step="llm_call",
     api_key=None,
+    json_mode=False,
 ):
-    client = get_compass_client(api_key)
+    client = get_deepseek_client(api_key)
     if client is None:
         return None
 
     started_at = time.perf_counter()
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
+        request = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+        if json_mode:
+            request["response_format"] = {"type": "json_object"}
+        response = client.chat.completions.create(
+            **request,
         )
         output = response.choices[0].message.content
         if isinstance(output, list):
@@ -803,7 +814,7 @@ def call_llm_text(
                 for item in output
             )
         if not output:
-            raise RuntimeError("Compass Chat Completions response did not contain text content.")
+            raise RuntimeError("DeepSeek Chat Completions response did not contain text content.")
     except Exception as error:
         if trace:
             trace.record(
@@ -854,6 +865,7 @@ def call_llm_json(
         agent=agent,
         step=step,
         api_key=api_key,
+        json_mode=True,
     )
     parsed = extract_json_object(output)
     if trace:
@@ -873,23 +885,28 @@ def profile_embedding_text(profile):
     )
 
 
-def infer_goal_profile_with_embedding(mission, model, trace=None, api_key=None):
-    """Route an open-ended goal by semantic similarity, not keyword membership."""
+def infer_goal_profile_with_embedding(mission, trace=None):
+    """Route an open-ended goal with a free local multilingual embedding model."""
     if not mission.strip():
         return None
     profiles = [DEFAULT_GOAL_PROFILE] + GOAL_PROFILES
-    vectors = embed_texts(
-        [mission] + [profile_embedding_text(profile) for profile in profiles],
-        api_key,
-        model,
+    query_vectors = embed_texts(
+        [mission],
         trace=trace,
         agent="PM Agent",
-        step="goal_embedding",
+        step="goal_embedding_query",
+        mode="query",
     )
-    if not vectors or len(vectors) != len(profiles) + 1:
+    profile_vectors = embed_texts(
+        [profile_embedding_text(profile) for profile in profiles],
+        trace=trace,
+        agent="PM Agent",
+        step="goal_embedding_profiles",
+        mode="passage",
+    )
+    if not query_vectors or not profile_vectors or len(profile_vectors) != len(profiles):
         return None
-
-    similarities = [cosine_similarity(vectors[0], vector) for vector in vectors[1:]]
+    similarities = [cosine_similarity(query_vectors[0], vector) for vector in profile_vectors]
     best_index = max(range(len(profiles)), key=lambda index: similarities[index])
     profile = dict(profiles[best_index])
     alternatives = sorted(
@@ -900,14 +917,14 @@ def infer_goal_profile_with_embedding(mission, model, trace=None, api_key=None):
         key=lambda item: item["similarity"],
         reverse=True,
     )[:3]
-    profile["analysis_source"] = "Embedding semantic router"
-    profile["llm_reason"] = f"语义相似度 {similarities[best_index]:.3f}，最接近“{profile['label']}”。"
+    profile["analysis_source"] = "Local embedding semantic router"
+    profile["llm_reason"] = f"本地语义相似度 {similarities[best_index]:.3f}，最接近“{profile['label']}”。"
     if trace:
         trace.record(
             "semantic_match",
             step="goal_analysis",
             agent="PM Agent",
-            input_data={"mission": mission, "embedding_model": model},
+            input_data={"mission": mission, "embedding_model": LOCAL_EMBEDDING_MODEL},
             output={"selected_profile": profile["key"], "alternatives": alternatives},
         )
     return profile
@@ -961,18 +978,12 @@ def analyze_goal(
     model,
     trace=None,
     api_key=None,
-    embedding_model=DEFAULT_EMBEDDING_MODEL,
 ):
     if use_llm:
         try:
-            profile = infer_goal_profile_with_embedding(
-                mission,
-                embedding_model,
-                trace=trace,
-                api_key=api_key,
-            )
+            profile = infer_goal_profile_with_embedding(mission, trace=trace)
             if profile:
-                return profile, "Embedding goal router"
+                return profile, "Local embedding goal router"
         except Exception as error:
             if trace:
                 trace.record(
@@ -981,17 +992,18 @@ def analyze_goal(
                     agent="PM Agent",
                     error=error,
                 )
-            if is_llm_capacity_error(error):
-                fallback = dict(infer_goal_profile(mission))
-                fallback["analysis_source"] = "Rule fallback"
-                fallback["llm_reason"] = "Embedding 服务不可用，已跳过后续 LLM 调用。"
-                fallback["llm_disabled_reason"] = llm_failure_notice(error)
-                return fallback, "Rule fallback after Compass 429"
         try:
             profile = infer_goal_profile_with_llm(mission, model, trace=trace, api_key=api_key)
             if profile:
-                return profile, "LLM goal analysis"
+                return profile, "DeepSeek semantic goal router"
         except Exception as error:
+            if trace:
+                trace.record(
+                    "semantic_match_failed",
+                    step="goal_analysis",
+                    agent="PM Agent",
+                    error=error,
+                )
             fallback = dict(infer_goal_profile(mission))
             fallback["analysis_source"] = "Rule fallback"
             fallback["llm_reason"] = "LLM 目标分析不可用，已使用规则分类。"
@@ -1001,7 +1013,7 @@ def analyze_goal(
     profile = dict(infer_goal_profile(mission))
     profile["analysis_source"] = "Rule fallback"
     if use_llm:
-        profile["llm_reason"] = "未输入 Compass API Key 或 openai SDK 不可用。"
+        profile["llm_reason"] = "未输入 DeepSeek API Key 或 openai SDK 不可用。"
         return profile, "Rule fallback because LLM is unavailable"
     profile["llm_reason"] = "LLM mode is off."
     return profile, "Rule-based goal parser"
@@ -1016,7 +1028,7 @@ def build_next_steps(goal_profile):
 
 
 def keyword_risk_findings(scored_news, priority_categories):
-    """Deterministic fallback for offline runs and embedding service failures."""
+    """Deterministic fallback for offline runs and local embedding failures."""
     findings = []
     for _, row in scored_news.reset_index().iterrows():
         headline = row["headline"]
@@ -1038,37 +1050,41 @@ def keyword_risk_findings(scored_news, priority_categories):
     return findings
 
 
-def semantic_risk_findings(scored_news, priority_categories, api_key, embedding_model, trace=None):
-    """Assign each headline to its closest risk theme using a single embedding batch."""
-    categories = list(RISK_CATEGORY_DESCRIPTIONS)
+def semantic_risk_findings(scored_news, priority_categories, trace=None):
+    """Map English headlines to the Chinese risk taxonomy with local embeddings."""
     headlines = scored_news.reset_index().to_dict("records")
-    vectors = embed_texts(
-        list(RISK_CATEGORY_DESCRIPTIONS.values()) + [row["headline"] for row in headlines],
-        api_key,
-        embedding_model,
+    categories = list(RISK_CATEGORY_DESCRIPTIONS)
+    category_vectors = embed_texts(
+        list(RISK_CATEGORY_DESCRIPTIONS.values()),
         trace=trace,
         agent="Risk Agent",
-        step="risk_embedding",
+        step="risk_embedding_categories",
+        mode="passage",
     )
-    if not vectors or len(vectors) != len(categories) + len(headlines):
+    headline_vectors = embed_texts(
+        [row["headline"] for row in headlines],
+        trace=trace,
+        agent="Risk Agent",
+        step="risk_embedding_headlines",
+        mode="query",
+    )
+    if not category_vectors or not headline_vectors:
         return None
-
-    category_vectors = vectors[: len(categories)]
     findings = []
-    for row, headline_vector in zip(headlines, vectors[len(categories) :]):
-        similarities = [cosine_similarity(headline_vector, vector) for vector in category_vectors]
+    for row, vector in zip(headlines, headline_vectors):
+        similarities = [cosine_similarity(vector, category_vector) for category_vector in category_vectors]
         best_index = max(range(len(categories)), key=lambda index: similarities[index])
         best_score = similarities[best_index]
-        if best_score < RISK_SEMANTIC_THRESHOLD:
+        if best_score < 0.35:
             continue
         category = categories[best_index]
         findings.append(
             {
                 "category": category,
                 "headline": row["headline"],
-                "matched_signal": f"semantic similarity {best_score:.3f}",
+                "matched_signal": f"local semantic similarity {best_score:.3f}",
                 "similarity": round(best_score, 3),
-                "classification_source": "embedding semantic classifier",
+                "classification_source": "local embedding semantic classifier",
                 "sentiment_score": round(row["sentiment_score"], 3),
                 "focus_match": "Yes" if category in priority_categories else "No",
             }
@@ -1081,28 +1097,23 @@ def detect_risks(
     snapshot,
     goal_profile,
     api_key=None,
-    embedding_model=DEFAULT_EMBEDDING_MODEL,
     trace=None,
+    use_semantic=False,
 ):
     priority_categories = set(goal_profile["priority_categories"])
-    classifier = "embedding semantic classifier"
-    try:
-        findings = semantic_risk_findings(
-            scored_news,
-            priority_categories,
-            api_key,
-            embedding_model,
-            trace=trace,
-        )
-    except Exception as error:
-        if trace:
-            trace.record(
-                "semantic_match_failed",
-                step="risk_analysis",
-                agent="Risk Agent",
-                error=error,
-            )
-        findings = None
+    classifier = "local embedding semantic classifier"
+    findings = None
+    if use_semantic:
+        try:
+            findings = semantic_risk_findings(scored_news, priority_categories, trace=trace)
+        except Exception as error:
+            if trace:
+                trace.record(
+                    "semantic_match_failed",
+                    step="risk_analysis",
+                    agent="Risk Agent",
+                    error=error,
+                )
     if findings is None:
         classifier = "keyword fallback"
         findings = keyword_risk_findings(scored_news, priority_categories)
@@ -1586,7 +1597,7 @@ def decide_next_action(state, use_llm, model, trace, api_key=None):
     available = valid_actions(state)
     if fallback_action not in available:
         fallback_action = available[0]
-    if not use_llm or get_compass_client(api_key) is None:
+    if not use_llm or get_deepseek_client(api_key) is None:
         decision = {
             "action": fallback_action,
             "reason": fallback_reason,
@@ -1719,7 +1730,7 @@ def fallback_critic_check(state):
 
 
 def self_check_memo(state, use_llm, model, trace, api_key=None):
-    if not use_llm or get_compass_client(api_key) is None:
+    if not use_llm or get_deepseek_client(api_key) is None:
         return fallback_critic_check(state)
 
     system_prompt = """
@@ -1800,7 +1811,6 @@ def execute_tool(
     model,
     trace,
     api_key=None,
-    embedding_model=DEFAULT_EMBEDDING_MODEL,
 ):
     step_number = state["tool_steps"] + 1
     agent = AGENT_TOOLS[action]["agent"]
@@ -1862,8 +1872,8 @@ def execute_tool(
                 state["snapshot"],
                 state["goal_profile"],
                 api_key=api_key,
-                embedding_model=embedding_model,
                 trace=trace,
+                use_semantic=use_llm,
             )
             detail = (
                 f"识别到 {len(state['risk']['findings'])} 个风险信号，其中 "
@@ -1898,7 +1908,13 @@ def execute_tool(
 
         elif action == "self_check":
             was_followup_review = state["pending_followup_review"]
-            state["critic"] = self_check_memo(state, use_llm, model, trace, api_key=api_key)
+            state["critic"] = self_check_memo(
+                state,
+                use_llm,
+                model,
+                trace,
+                api_key=api_key,
+            )
             state["reviewed_memo_version"] = state["memo_version"]
             state["pending_followup_review"] = False
             state["revision_requested"] = bool(state["critic"].get("should_retrieve")) and not state["sec_attempted"]
@@ -1968,7 +1984,6 @@ def run_workflow(
     llm_model=DEFAULT_LLM_MODEL,
     trace_dir=None,
     api_key=None,
-    embedding_model=DEFAULT_EMBEDDING_MODEL,
     prior_memory=None,
     messages=None,
 ):
@@ -1988,7 +2003,6 @@ def run_workflow(
             "allow_fallback_data": allow_fallback_data,
             "llm_enabled": use_llm,
             "llm_model": llm_model,
-            "embedding_model": embedding_model,
             "is_follow_up": is_follow_up,
             "conversation_turns": len(messages),
         },
@@ -2000,7 +2014,6 @@ def run_workflow(
         llm_model,
         trace=trace,
         api_key=api_key,
-        embedding_model=embedding_model,
     )
     trace.record(
         "tool_completed",
@@ -2081,7 +2094,6 @@ def run_workflow(
                 llm_model,
                 trace,
                 api_key=api_key,
-                embedding_model=embedding_model,
             )
         )
     else:
@@ -2289,6 +2301,8 @@ def main():
         st.session_state.agent_memory = None
     if "last_result" not in st.session_state:
         st.session_state.last_result = None
+    if "llm_model" not in st.session_state:
+        st.session_state.llm_model = DEFAULT_LLM_MODEL
 
     with st.sidebar:
         st.header("Analysis Settings")
@@ -2297,17 +2311,19 @@ def main():
         max_headlines = st.slider("Headlines to analyze", 6, 30, 16)
         use_llm = st.checkbox("Use LLM for goal analysis and memo", value=True)
         api_key = st.text_input(
-            "Compass API key",
+            "DeepSeek API key",
             type="password",
             disabled=not use_llm,
-            help="填写已获批的 Compass DQP/SQP Key；仅用于当前浏览器会话，不会写入 trace、文件或环境变量。",
+            help="仅用于当前浏览器会话，不会写入 trace、文件或环境变量。",
         )
-        llm_model = st.text_input("Compass chat model", DEFAULT_LLM_MODEL, disabled=not use_llm)
-        embedding_model = st.text_input(
-            "Compass embedding model", DEFAULT_EMBEDDING_MODEL, disabled=not use_llm
+        llm_model = st.text_input(
+            "DeepSeek model",
+            disabled=not use_llm,
+            key="llm_model",
+            help="默认 deepseek-v4-flash；也可填写 deepseek-v4-pro。",
         )
         st.caption(
-            "调用 Compass Chat Completions 与 Embeddings API。Key 必须已完成 DQP/SQP 审批并有模型权限；关闭或刷新页面后需重新输入。"
+            "DeepSeek 用于研究推理；免费本地 multilingual-e5-small 用于语义 embedding，不需要第二个 API Key。"
         )
         allow_fallback_data = st.checkbox("Use offline sample data if live fetch fails", value=False)
         if st.button("New research conversation"):
@@ -2333,7 +2349,7 @@ def main():
             st.warning("Please enter a stock ticker.")
             return
         if use_llm and not api_key.strip():
-            st.warning("请输入已获批的 Compass API key，或关闭 LLM 模式后使用规则基线运行。")
+            st.warning("请输入 DeepSeek API key，或关闭 LLM 模式后使用规则基线运行。")
             return
 
         st.session_state.messages.append({"role": "user", "content": mission})
@@ -2349,7 +2365,6 @@ def main():
                     use_llm,
                     llm_model,
                     api_key=api_key.strip(),
-                    embedding_model=embedding_model,
                     prior_memory=st.session_state.agent_memory,
                     messages=st.session_state.messages,
                 )
