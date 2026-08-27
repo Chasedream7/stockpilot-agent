@@ -143,6 +143,33 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(profile["key"], "regulation_review")
         self.assertEqual(tool, "High-signal intent router")
 
+    def test_repeated_llm_follow_up_is_wrapped_with_latest_question(self):
+        first, _ = self.run_case("判断近期新闻是否改变我的长期持仓逻辑")
+        latest_question = "你刚才提到的监管风险，具体是哪一份披露支持？"
+        original_call = app.call_llm_text
+        self.addCleanup(setattr, app, "call_llm_text", original_call)
+        app.call_llm_text = lambda *args, **kwargs: first["memo"]
+
+        memo, _ = app.build_memo(
+            "TEST",
+            latest_question,
+            app.profile_by_key("regulation_review"),
+            first["summary"],
+            first["risk"],
+            first["snapshot"],
+            first["scored_news"],
+            first["source_note"],
+            use_llm=True,
+            model="test-model",
+            sec_filings=first["sec_filings"],
+            previous_memo=first["memo"],
+            is_follow_up=True,
+        )
+
+        self.assertNotEqual(memo, first["memo"])
+        self.assertIn("本轮追问回答", memo)
+        self.assertIn(latest_question, memo)
+
 
 class SemanticRoutingTest(unittest.TestCase):
     def setUp(self):
