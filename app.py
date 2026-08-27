@@ -1406,6 +1406,73 @@ def compact_headlines(scored_news, limit=10):
     ]
 
 
+def build_followup_answer_block(mission, sec_filings=None, risk=None):
+    """Build a deterministic answer header for every follow-up turn.
+
+    A provider can occasionally copy the previous memo instead of answering a
+    third-turn question.  This block makes the latest question and its evidence
+    delta visible even when the generated body is repetitive.
+    """
+    filings = (sec_filings or {}).get("filings", [])
+    lines = [
+        "**本轮追问回答**",
+        f"- 最新问题：{mission}",
+        "- 相对上一轮：本轮只回答最新问题，并复用已保留的研究证据。",
+    ]
+    lower_mission = mission.lower()
+    asks_primary = any(
+        term in lower_mission
+        for term in ["sec", "披露", "公告", "filing", "哪一份", "原文", "核验"]
+    )
+    if asks_primary:
+        if filings:
+            lines.append("- 一手来源入口：")
+            for filing in filings[:3]:
+                form = filing.get("form", "SEC filing")
+                filed_at = filing.get("filed_at", "日期未知")
+                url = filing.get("document_url", "")
+                source_line = f"  - {form}（提交于 {filed_at}）"
+                if url:
+                    source_line += f"：{url}"
+                lines.append(source_line)
+            lines.append(
+                "- 以上是已取得的 SEC 申报元数据入口；若未读取正文，不能把新闻标题直接等同于披露结论。"
+            )
+        else:
+            lines.append(
+                "- 本轮未成功取得 SEC 或公司公告，监管结论仍属于待核验信息，不能表述为已被一手来源证实。"
+            )
+
+    risk_findings = (risk or {}).get("findings", [])
+    if any(term in lower_mission for term in ["监管", "反垄断", "诉讼", "调查", "合规", "法律"]):
+        matching_headlines = []
+        for finding in risk_findings:
+            if finding.get("category") == "监管/法律":
+                headline = finding.get("headline")
+                if headline and headline not in matching_headlines:
+                    matching_headlines.append(headline)
+        if matching_headlines:
+            lines.append("- 上一轮提到的监管类新闻证据：")
+            lines.extend(f"  - {headline}" for headline in matching_headlines[:3])
+    return "\n".join(lines)
+
+
+def ensure_followup_memo(memo, mission, sec_filings=None, risk=None, previous_memo=None):
+    """Guarantee that a follow-up visibly answers the newest user question."""
+    if not memo:
+        return memo
+    answer_block = build_followup_answer_block(
+        mission, sec_filings=sec_filings, risk=risk
+    )
+    normalized_memo = " ".join(str(memo).split())
+    normalized_previous = " ".join(str(previous_memo or "").split())
+    if normalized_previous and normalized_memo == normalized_previous:
+        return f"{answer_block}\n\n{memo}"
+    if "本轮追问回答" not in str(memo) or mission not in str(memo):
+        return f"{answer_block}\n\n{memo}"
+    return memo
+
+
 def build_llm_memo(
     ticker,
     mission,
@@ -1421,6 +1488,7 @@ def build_llm_memo(
     api_key=None,
     conversation_history=None,
     is_follow_up=False,
+    previous_memo=None,
 ):
     system_prompt = """
 You are Portfolio Copilot inside StockPilot Agent.
@@ -1429,8 +1497,12 @@ Use only the supplied metrics, headlines, and risk findings.
 Do not invent news, prices, financial facts, or future predictions.
 Do not provide direct buy/sell/hold instructions.
 Frame conclusions as observation and review guidance, not investment advice.
-If this is a follow-up question, answer the latest question first, explicitly state
-what changed from the previous memo, and do not simply repeat the previous memo.
+If this is a follow-up question, treat the latest user question as authoritative:
+answer it first, explicitly state what changed from the previous memo, and do not
+simply repeat the previous memo. Start the answer with the exact latest question.
+For questions asking which disclosure supports a claim, enumerate the supplied SEC
+filing form/date/URL and clearly distinguish metadata from evidence in the filing
+body. If no primary source is supplied, say that the claim remains unverified.
 If no new source was retrieved, say so clearly and tie the answer to retained evidence.
 """.strip()
 
@@ -1460,6 +1532,8 @@ If no new source was retrieved, say so clearly and tie the answer to retained ev
         "sec_filings": sec_filings or {},
         "conversation_history": compact_conversation(conversation_history),
         "is_follow_up": is_follow_up,
+        "latest_question": mission,
+        "previous_memo": short_text(previous_memo or "", 6000),
     }
     user_prompt = f"""
 Create the memo in Markdown with these sections:
@@ -1505,6 +1579,7 @@ def build_memo(
     api_key=None,
     conversation_history=None,
     is_follow_up=False,
+    previous_memo=None,
 ):
     if use_llm:
         try:
@@ -1523,9 +1598,19 @@ def build_memo(
                 api_key=api_key,
                 conversation_history=conversation_history,
                 is_follow_up=is_follow_up,
+                previous_memo=previous_memo,
             )
             if memo:
-                return memo.strip(), "LLM memo generator"
+                memo = memo.strip()
+                if is_follow_up:
+                    memo = ensure_followup_memo(
+                        memo,
+                        mission,
+                        sec_filings=sec_filings,
+                        risk=risk,
+                        previous_memo=previous_memo,
+                    )
+                return memo, "LLM memo generator"
         except Exception:
             pass
 
@@ -2071,6 +2156,7 @@ def execute_tool(
                 api_key=api_key,
                 conversation_history=state["messages"],
                 is_follow_up=state["is_follow_up"],
+                previous_memo=state.get("memo"),
             )
             state["memo"] = memo
             state["memo_tool"] = tool_label
